@@ -8813,6 +8813,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen3.6-27B M=2 target-verification shapes.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 2,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, 2, 17408, {1, 1}, {1, 1}));
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -9586,6 +9592,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Production Qwen3.6 M=2 gate/up fusion shapes on gfx908.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 17408, 5120,
+        false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 5120, 17408,
+        false, 1, 1, false, false, true, false, {1, 1}));
+
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
             for (bool bias_probs : {false, true}) {
@@ -9680,6 +9694,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // gfx908 Qwen3.6 dense-matmul geometry oracle. These are the two
+    // dominant FFN matrix shapes from the 27B model. Keep this compact so
+    // CDNA MMQ geometry variants can be screened without full-model runs.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int n : {384, 448, 512, 768, 1024}) {
+            // ffn_gate / ffn_up: [k=5120, m=17408]
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            // ffn_down: [k=17408, m=5120]
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
