@@ -1446,6 +1446,214 @@ static bool ggml_cuda_should_use_iq4_nl_fused_gfx908(
         dst->ne[2]  == 1 && dst->ne[3]  == 1;
 }
 
+#if defined(GGML_USE_HIP)
+#include <rocblas/rocblas.h>
+
+// rocBLAS' Tensile selection heuristic picks a poor solution for a handful of
+// the GEMM shapes these models hit on gfx908.  The worst by far is the Qwen3.6
+// GDN qkv projection (M=10240, K=5120): the default solution runs at ~27 TFLOPS
+// while a solution already present in the shipped Tensile library reaches
+// ~120-130 TFLOPS.  Measured with rocm-gfx908-7.15.0a20260720:
+//
+//   shape                     M      K       default        selected
+//   attn_qkv              10240   5120    26.6/26.9 TF   128.6/119.3 TF
+//   ssm_out                5120   6144    92.6/96.1 TF   116.1/103.6 TF
+//   ffn_down               5120  17408   105.0/109.1 TF  111.9/116.5 TF
+//   ffn_gate, ffn_up      17408   5120   117.5/121.2 TF  122.0/128.6 TF
+//                                        (N=1024 / N=2048)
+//
+// Solution indices are opaque and specific to the rocBLAS build, so each entry
+// is probed once on first use and dropped if the library rejects it.
+// Several of the fastest solutions need a Tensile workspace that rocBLAS cannot
+// allocate once llama.cpp owns most of VRAM -- they return
+// rocblas_status_internal_error at run time even though they probe fine in a
+// standalone harness.  So each shape carries a ranked candidate list and the
+// first one the library actually accepts is latched in.
+#define GFX908_GEMM_MAX_CANDIDATES 6
+
+// Solution indices are themselves negative, so latch state needs its own field
+// rather than a sentinel value in `chosen`.
+enum ggml_cuda_gfx908_gemm_state {
+    GFX908_GEMM_UNPROBED = 0,
+    GFX908_GEMM_LATCHED,
+    GFX908_GEMM_DISABLED,
+};
+
+struct ggml_cuda_gfx908_gemm_entry {
+    int64_t m;
+    int64_t k;
+    int32_t candidates[GFX908_GEMM_MAX_CANDIDATES];
+    int32_t chosen;
+    ggml_cuda_gfx908_gemm_state state;
+};
+
+// Candidates are ordered by worst-case TFLOPS across N=1024 and N=2048,
+// measured on rocm-gfx908-7.15.0a20260720 through a hipBLAS-created handle.
+static ggml_cuda_gfx908_gemm_entry g_gfx908_gemm_entries[] = {
+    // attn_qkv (GDN qkv projection): default 26.6/26.9 TF -> ~119-129 TF
+    { 10240,  5120, { -606078414, -606078442, -606078497, -606078426, -606078405, -606078482 }, 0, GFX908_GEMM_UNPROBED },
+    // ssm_out: default 92.5/96.0 TF -> ~104-117 TF
+    {  5120,  6144, { -606078399, -606078451, -606078381, -606078476, -606078426, -606078436 }, 0, GFX908_GEMM_UNPROBED },
+    // ffn_down: default 104.9/109.1 TF -> ~112-116 TF
+    {  5120, 17408, { -606078440, -606078476, -606078479, -606078446, -606078381, -606078399 }, 0, GFX908_GEMM_UNPROBED },
+    // ffn_gate, ffn_up: default 116.7/121.2 TF -> ~122-129 TF
+    { 17408,  5120, { -606078449, -606078448, -606078414, -606078434, -606078412, -606078482 }, 0, GFX908_GEMM_UNPROBED },
+    // attn_gate: default 111.6/111.5 TF -> ~111-115 TF
+    {  6144,  5120, { -606078381, -606078476, -606078399, -606078451, -606078403, -606078490 }, 0, GFX908_GEMM_UNPROBED },
+    // attn_q: default 111.9/118.2 TF -> ~114-118 TF
+    { 12288,  5120, { -606078434, -606078508, -606078447, -606078449, -606078448, -606078435 }, 0, GFX908_GEMM_UNPROBED },
+};
+
+// Below this N the selected solutions were not measured; leave those to rocBLAS.
+static const int64_t GFX908_GEMM_SOLUTION_MIN_N = 256;
+
+static ggml_cuda_gfx908_gemm_entry * ggml_cuda_gfx908_gemm_entry_for(
+        int cc, int64_t m, int64_t n, int64_t k,
+        cudaDataType_t type_a, cudaDataType_t type_b, cudaDataType_t type_d,
+        cublasComputeType_t compute) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_ROCBLAS_SOLUTION_GFX908");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+
+    if (!enabled || cc != GGML_CUDA_CC_CDNA1 || n < GFX908_GEMM_SOLUTION_MIN_N) {
+        return nullptr;
+    }
+    // Only the f16-in / f32-accum / f32-out form was measured.
+    if (type_a != CUDA_R_16F || type_b != CUDA_R_16F ||
+        type_d != CUDA_R_32F || compute != CUBLAS_COMPUTE_32F) {
+        return nullptr;
+    }
+    for (auto & entry : g_gfx908_gemm_entries) {
+        if (entry.m == m && entry.k == k && entry.state != GFX908_GEMM_DISABLED) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+// Returns true if the GEMM was issued with a selected solution.
+static bool ggml_cuda_gfx908_gemm_try(
+        ggml_cuda_gfx908_gemm_entry * entry, cublasHandle_t handle,
+        int64_t m, int64_t n, int64_t k,
+        const void * alpha, const void * a, int64_t lda,
+                            const void * b, int64_t ldb,
+        const void * beta,        void * d, int64_t ldd) {
+    // On the AMD backend hipBLAS exposes its rocBLAS handle as the opaque
+    // hipblasHandle_t. Codex validated this bridge on this ROCm build.
+    rocblas_handle rb = reinterpret_cast<rocblas_handle>(handle);
+    static const bool debug = getenv("GGML_HIP_ROCBLAS_SOLUTION_DEBUG") != nullptr;
+
+    // Selecting a solution by index requires the full Tensile host library to be
+    // resident. llama.cpp never calls rocblas_initialize(), so rocBLAS is left in
+    // its lazy-loading mode and only part of the solution set resolves.
+    static const bool tensile_loaded = [] { rocblas_initialize(); return true; }();
+    GGML_UNUSED(tensile_loaded);
+
+    // The fast solutions for the tall shapes are split-K (Tensile GSU) kernels
+    // and need a workspace. hipBLAS' handle does not carry one, so rocBLAS
+    // returns internal_error for every one of them. Size the requirement with
+    // rocBLAS' own query API and hand the handle a buffer once.
+    static void * workspace     = nullptr;
+    static size_t workspace_sz  = 0;
+    auto ensure_workspace = [&](size_t need) {
+        if (need <= workspace_sz) {
+            return workspace_sz > 0;
+        }
+        void * buf = nullptr;
+        if (cudaMalloc(&buf, need) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        if (rocblas_set_workspace(rb, buf, need) != rocblas_status_success) {
+            cudaFree(buf);
+            return false;
+        }
+        // Intentionally not freeing the previous buffer: rocBLAS may still
+        // reference it, and this grows at most a couple of times.
+        workspace    = buf;
+        workspace_sz = need;
+        GGML_LOG_INFO("%s: gfx908 rocBLAS workspace set to %.1f MiB\n",
+                      __func__, need / (1024.0 * 1024.0));
+        return true;
+    };
+
+    auto issue = [&](int32_t solution) {
+        return rocblas_gemm_ex(
+            rb, rocblas_operation_transpose, rocblas_operation_none,
+            m, n, k, alpha,
+            a, rocblas_datatype_f16_r, lda,
+            b, rocblas_datatype_f16_r, ldb, beta,
+            d, rocblas_datatype_f32_r, ldd,
+            d, rocblas_datatype_f32_r, ldd,
+            rocblas_datatype_f32_r,
+            rocblas_gemm_algo_solution_index, solution,
+            rocblas_gemm_flags_none);
+    };
+
+    if (entry->state == GFX908_GEMM_LATCHED) {
+        // Already latched. A latched solution can still fail if memory
+        // conditions change; fall back permanently if it does.
+        const rocblas_status status = issue(entry->chosen);
+        if (status == rocblas_status_success) {
+            return true;
+        }
+        GGML_LOG_WARN("%s: gfx908 rocBLAS solution %d stopped working for M=%" PRId64
+                      " K=%" PRId64 " (%s); reverting to rocBLAS default\n",
+                      __func__, entry->chosen, entry->m, entry->k,
+                      rocblas_status_to_string(status));
+        entry->state = GFX908_GEMM_DISABLED;
+        return false;
+    }
+
+    for (const int32_t candidate : entry->candidates) {
+        if (candidate == 0) {
+            break;
+        }
+        rocblas_status status = issue(candidate);
+
+        if (status != rocblas_status_success) {
+            // Ask rocBLAS how much workspace this solution wants, provide it,
+            // and retry once.
+            size_t need = 0;
+            if (rocblas_start_device_memory_size_query(rb) == rocblas_status_success) {
+                issue(candidate);
+                if (rocblas_stop_device_memory_size_query(rb, &need) == rocblas_status_success &&
+                    need > 0 && ensure_workspace(need)) {
+                    status = issue(candidate);
+                }
+            }
+            if (debug) {
+                auto align_of = [](const void * p) {
+                    const uintptr_t v = (uintptr_t) p;
+                    return v == 0 ? 0u : (unsigned) (v & -(intptr_t) v);
+                };
+                fprintf(stderr, "gfx908-gemm-probe: sol=%d ws=%zu align a=%u b=%u d=%u\n",
+                        candidate, need, align_of(a), align_of(b), align_of(d));
+            }
+        }
+
+        if (debug) {
+            fprintf(stderr, "gfx908-gemm-probe: m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                            " lda=%" PRId64 " ldb=%" PRId64 " ldd=%" PRId64 " sol=%d -> %s\n",
+                    m, n, k, lda, ldb, ldd, candidate, rocblas_status_to_string(status));
+        }
+        if (status == rocblas_status_success) {
+            entry->chosen = candidate;
+            entry->state  = GFX908_GEMM_LATCHED;
+            GGML_LOG_INFO("%s: gfx908 using rocBLAS solution %d for M=%" PRId64
+                          " K=%" PRId64 "\n", __func__, candidate, entry->m, entry->k);
+            return true;
+        }
+    }
+
+    GGML_LOG_WARN("%s: gfx908 no rocBLAS solution accepted for M=%" PRId64 " K=%" PRId64
+                  "; using rocBLAS default\n", __func__, entry->m, entry->k);
+    entry->state = GFX908_GEMM_DISABLED;
+    return false;
+}
+#endif // GGML_USE_HIP
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1609,14 +1817,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ne0));
     } else if (ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                    ne01, ne11, ne10,
-                    alpha, src0_ptr, cu_data_type_a, s01,
-                           src1_ptr, cu_data_type_b, s11,
-                    beta,   dst_ptr, cu_data_type,   ne0,
-                    cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        bool issued = false;
+#if defined(GGML_USE_HIP)
+        if (auto * entry = ggml_cuda_gfx908_gemm_entry_for(
+                cc, ne01, ne11, ne10, cu_data_type_a, cu_data_type_b, cu_data_type, cu_compute_type)) {
+            issued = ggml_cuda_gfx908_gemm_try(
+                entry, ctx.cublas_handle(), ne01, ne11, ne10,
+                alpha, src0_ptr, s01, src1_ptr, s11, beta, dst_ptr, ne0);
+        }
+#endif
+        if (!issued) {
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                        ne01, ne11, ne10,
+                        alpha, src0_ptr, cu_data_type_a, s01,
+                               src1_ptr, cu_data_type_b, s11,
+                        beta,   dst_ptr, cu_data_type,   ne0,
+                        cu_compute_type,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
