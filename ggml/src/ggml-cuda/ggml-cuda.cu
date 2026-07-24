@@ -2212,6 +2212,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
+    // mul_mat_vec_f's fused path asserts `ids || dst->ne[1] == 1` (mmvf.cu), so a
+    // plain MUL_MAT with ne[1] > 1 must not be fused. This guard exists upstream;
+    // dropping it aborts any model that has a fusable f16/f32 matmul wider than
+    // one column -- Qwen3.6-35B does, Qwen3.6-27B happens not to.
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+        return false;
+    }
+
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
         return false;
     }
