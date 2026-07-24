@@ -6,6 +6,8 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <cstdio>
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -158,6 +160,37 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
+            // gfx908: the ncols1/ncols2 heuristic carries explicit NVIDIA
+            // carve-outs, so allow the tile shape to be pinned for measurement.
+            // Format "ncols1,ncols2"; only combinations actually instantiated for
+            // 256/256 are honoured, anything else falls through to the heuristic.
+            if (const char * fattn_env = getenv("GGML_HIP_FATTN_NCOLS_256")) {
+                int n1 = 0, n2 = 0;
+                if (sscanf(fattn_env, "%d,%d", &n1, &n2) == 2) {
+#define GGML_HIP_FATTN_TRY(N1, N2)                                                         \
+                    if (n1 == (N1) && n2 == (N2)) {                                        \
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, N1, N2>(ctx, dst);  \
+                        break;                                                             \
+                    }
+                    GGML_HIP_FATTN_TRY( 1, 8)
+                    GGML_HIP_FATTN_TRY( 2, 4)
+                    GGML_HIP_FATTN_TRY( 2, 8)
+                    GGML_HIP_FATTN_TRY( 4, 2)
+                    GGML_HIP_FATTN_TRY( 4, 4)
+                    GGML_HIP_FATTN_TRY( 4, 8)
+                    GGML_HIP_FATTN_TRY( 8, 1)
+                    GGML_HIP_FATTN_TRY( 8, 2)
+                    GGML_HIP_FATTN_TRY( 8, 4)
+                    GGML_HIP_FATTN_TRY( 8, 8)
+                    GGML_HIP_FATTN_TRY(16, 1)
+                    GGML_HIP_FATTN_TRY(16, 2)
+                    GGML_HIP_FATTN_TRY(16, 4)
+                    GGML_HIP_FATTN_TRY(32, 1)
+                    GGML_HIP_FATTN_TRY(32, 2)
+                    GGML_HIP_FATTN_TRY(64, 1)
+#undef GGML_HIP_FATTN_TRY
+                }
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
         case 320:
