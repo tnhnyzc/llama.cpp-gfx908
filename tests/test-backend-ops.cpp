@@ -9721,6 +9721,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Decode shapes (n=1 mmvq, n=2 MTP). The perf list above starts at n=384,
+    // so the batch-1 path that dominates token generation was never measured
+    // here. These are the four real per-layer tensors of Qwen3.6-27B.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat(   // ffn_gate / ffn_up
+                type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(   // ffn_down
+                type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(   // attn_q / attn_o
+                type_a, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(   // attn_k / attn_v
+                type_a, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
     uint32_t                        kwh_idx  = 1;
