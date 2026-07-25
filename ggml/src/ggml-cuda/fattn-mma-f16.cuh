@@ -1111,7 +1111,15 @@ template<int DV, int ncols> struct mma_tile_sizes {
     // conversions). The kernel already supports a float VKQ accumulator -- the
     // branches at the KQ_max rescale below are written for both, and the RDNA3
     // path already uses float for DV=80/112.
-    using T_C_VKQ = tile<16, 16, float>; // column-major
+    //
+    // But it is not a free win: a float tile is ne=4 (4 VGPRs) where the half2
+    // tile is ne=2 (2 VGPRs) for the same values, so at DV=256 it costs ~32 more
+    // VGPRs. Prefill is compute-bound and the removed conversions dominate;
+    // decode is latency-bound and wants the occupancy instead. Measured on a
+    // real 27891-token request: float everywhere gave PP +4.77% but TG -2.55%.
+    // Gate it on ncols so the large prefill tiles (deployed config is
+    // ncols1=32 x ncols2=2 = 64) take f32 and the small decode tiles keep half2.
+    using T_C_VKQ = std::conditional_t<(ncols >= 32), tile<16, 16, float>, tile<16, 8, half2>>; // column-major
 };
 #else // Volta
 template<int DV, int ncols> struct mma_tile_sizes {
