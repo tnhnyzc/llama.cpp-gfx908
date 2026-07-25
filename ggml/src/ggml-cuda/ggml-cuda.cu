@@ -1636,7 +1636,7 @@ static ggml_cuda_gfx908_gemm_val ggml_cuda_gfx908_gemm_autotune(
     hipStream_t stream = nullptr;
     rocblas_get_stream(rb, &stream);
 
-    auto measure = [&](rocblas_gemm_algo algo, int32_t sol) -> float {
+    auto measure = [&](rocblas_gemm_algo algo, int32_t sol, int iters) -> float {
         if (issue(algo, sol) != rocblas_status_success) {
             return -1.0f;
         }
@@ -1648,7 +1648,6 @@ static ggml_cuda_gfx908_gemm_val ggml_cuda_gfx908_gemm_autotune(
         hipEventCreate(&t0);
         hipEventCreate(&t1);
         hipEventRecord(t0, stream);
-        const int iters = 3;
         for (int i = 0; i < iters; ++i) {
             if (issue(algo, sol) != rocblas_status_success) {
                 hipEventDestroy(t0);
@@ -1675,7 +1674,7 @@ static ggml_cuda_gfx908_gemm_val ggml_cuda_gfx908_gemm_autotune(
         return (float) (flops / (per_iter_ms * 1e9));
     };
 
-    const float default_tf = measure(rocblas_gemm_algo_standard, 0);
+    const float default_tf = measure(rocblas_gemm_algo_standard, 0, 3);
 
     rocblas_int count = 0;
     rocblas_gemm_ex_get_solutions(
@@ -1701,16 +1700,31 @@ static ggml_cuda_gfx908_gemm_val ggml_cuda_gfx908_gemm_autotune(
             rocblas_gemm_flags_none, solutions.data(), &count);
     }
 
+    // Two-phase search. Timing all ~175 solutions at 3 iterations each costs
+    // roughly 700 kernel launches per shape, which showed up as multi-second
+    // stalls on a user's first request for a model with many unseen shapes.
+    // Screen everything at 1 iteration, then re-time only the leaders properly.
     ggml_cuda_gfx908_gemm_val best = { 0, default_tf };
     int tested = 0;
+
+    std::vector<std::pair<float, rocblas_int>> screened;
+    screened.reserve(solutions.size());
     for (const rocblas_int sol : solutions) {
-        const float tf = measure(rocblas_gemm_algo_solution_index, sol);
+        const float tf = measure(rocblas_gemm_algo_solution_index, sol, 1);
         if (tf < 0.0f) {
             continue;
         }
         ++tested;
+        screened.emplace_back(tf, sol);
+    }
+
+    const size_t n_finalists = std::min<size_t>(screened.size(), 8);
+    std::partial_sort(screened.begin(), screened.begin() + n_finalists, screened.end(),
+                      [](const auto & a, const auto & b) { return a.first > b.first; });
+    for (size_t i = 0; i < n_finalists; ++i) {
+        const float tf = measure(rocblas_gemm_algo_solution_index, screened[i].second, 3);
         if (tf > best.tflops) {
-            best = { sol, tf };
+            best = { screened[i].second, tf };
         }
     }
 
