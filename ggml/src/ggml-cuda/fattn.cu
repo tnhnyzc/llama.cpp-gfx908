@@ -235,6 +235,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
+#if defined(GGML_USE_HIP)
+            // Same long-context question as head-dim 256 (see above). Gemma4 mixes
+            // 512- and 256-wide attention, so its global-attention layers land here.
+            if (const char * fattn_env = getenv("GGML_HIP_FATTN_NCOLS_512")) {
+                int n1 = 0, n2 = 0;
+                if (sscanf(fattn_env, "%d,%d", &n1, &n2) == 2) {
+#define GGML_HIP_FATTN_TRY512(N1, N2)                                                      \
+                    if (n1 == (N1) && n2 == (N2)) {                                        \
+                        ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, N1, N2>(ctx, dst);  \
+                        break;                                                             \
+                    }
+                    GGML_HIP_FATTN_TRY512( 4, 2)
+                    GGML_HIP_FATTN_TRY512( 8, 2)
+                    GGML_HIP_FATTN_TRY512( 8, 4)
+                    GGML_HIP_FATTN_TRY512( 8, 8)
+                    GGML_HIP_FATTN_TRY512(16, 2)
+                    GGML_HIP_FATTN_TRY512(16, 4)
+                    GGML_HIP_FATTN_TRY512(32, 2)
+#undef GGML_HIP_FATTN_TRY512
+                }
+            }
+#endif
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
             break;
         case 576: {
