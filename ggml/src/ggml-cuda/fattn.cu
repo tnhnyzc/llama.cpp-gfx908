@@ -191,6 +191,30 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 #undef GGML_HIP_FATTN_TRY
                 }
             }
+#if defined(GGML_USE_HIP)
+            // gfx908, long context: the upstream heuristic picks ncols1=8,ncols2=8
+            // for this head size, which is tuned for short prompts. Flash attention
+            // is quadratic in KV length, so it grows from ~10% of prefill at 8k
+            // context to ~26% at 32k -- and in that regime a taller, narrower tile
+            // wins. Measured (Qwen3.6-27B IQ4_NL, pp = KV length):
+            //     4k   1463.6 -> 1466.8   (+0.2%)
+            //     8k   1499.7 -> 1491.4   (-0.6%)
+            //    32k   1138.8 -> 1199.1   (+5.3%)
+            //    64k    912.8 ->  995.1   (+9.0%)
+            // Neutral below the threshold, so only switch where it was measured to
+            // help. GGML_HIP_FATTN_LONGCTX_GFX908=0 disables.
+            {
+                static const bool longctx_enabled = [] {
+                    const char * e = getenv("GGML_HIP_FATTN_LONGCTX_GFX908");
+                    return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+                }();
+                const int cc_local = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                if (longctx_enabled && cc_local == GGML_CUDA_CC_CDNA1 && K->ne[1] >= 8192) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, dst);
+                    break;
+                }
+            }
+#endif
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
         case 320:
