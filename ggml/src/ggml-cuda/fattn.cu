@@ -613,7 +613,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if ((Q->ne[0] <= 128 && Q->ne[1] * gqa_ratio_eff > 16)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
-        if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
+        // The >64 bound means MTP decode (Q->ne[1]=3, gqa_ratio 5-6 -> 15-18) never
+        // reaches MMA and stays on flash_attn_tile no matter how deep the KV is.
+        // The selector looks at effective query width but not KV depth, and FA's
+        // share of decode grows with depth. Tunable so that can be measured.
+        static const int64_t decode_thresh = [] {
+            const char * e = getenv("GGML_HIP_FATTN_MMA_DECODE_THRESH");
+            // Default 8 on CDNA1 (this branch is amd_mfma only): MTP decode is
+            // Q->ne[1]=3 x gqa 5-6 = 15-18, so the upstream 64 kept it on
+            // flash_attn_tile at every KV depth. Measured Qwen3.6-27B-Fast with
+            // greedy sampling (acceptance matched): ~21k +0.15%, ~32k +1.58% TG.
+            // The gain grows with depth because FA's share of decode does.
+            return e ? (int64_t) atoll(e) : (int64_t) 8;
+        }();
+        if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > decode_thresh)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
     }
