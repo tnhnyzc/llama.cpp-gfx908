@@ -1375,7 +1375,11 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
-#define VDR_IQ4_NL_Q8_1_MMVQ 2
+// VDR 2 -> 4 puts one thread on a whole 16-byte block instead of two threads on
+// 8 bytes each. QI4_NL is 4, so qi/vdr becomes 1 and each thread issues a single
+// wide load rather than two narrow ones. Measured on gfx908 at the ffn shape
+// (m=17408, k=5120): 778 -> 841 GB/s. IQ4_XS already ships with VDR 4.
+#define VDR_IQ4_NL_Q8_1_MMVQ 4
 #define VDR_IQ4_NL_Q8_1_MMQ  4
 
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
@@ -1387,7 +1391,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 
     int sumi = 0;
 #pragma unroll
-    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
@@ -1412,7 +1416,7 @@ static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_m2(
     int sumi_0 = 0;
     int sumi_1 = 0;
 #pragma unroll
-    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
