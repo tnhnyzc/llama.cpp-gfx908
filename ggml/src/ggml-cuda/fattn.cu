@@ -588,7 +588,25 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
-    if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    // gfx908 experiment: the <=256 bound means head-dim 512 (Gemma4's global-attention
+    // layers) can never reach MMA and always falls through to the tile kernel. Raise the
+    // bound to 512 behind an env gate to find out whether MMA is actually better there.
+    // NOTE: this also invalidates the A29 "head-dim 512 tile sweep" -- that override sits
+    // inside the dispatch switch, which is only reached once MMA has been selected, so it
+    // never fired and all three of its measurements were the tile kernel.
+    // Measured on gfx908 with Gemma4-31B (mixed 512/256 head dims), thermally
+    // gated, both orders: pp8192 1012.9 -> 1047.1 (+3.4%), pp32768 612.2 ->
+    // 751.4 (+22.7%). TG neutral. FLASH_ATTN_EXT 0 failures. The gain grows with
+    // context because FA's share of prefill does.
+    // Set GGML_HIP_FATTN_MMA_HS512=0 to restore the upstream <=256 bound.
+    static const int64_t mfma_hs_max = [] {
+        const char * e = getenv("GGML_HIP_FATTN_MMA_HS512");
+        return (e && e[0] == '0' && e[1] == '\0') ? 256 : 512;
+    }();
+    if ((amd_mfma_available(cc) && Q->ne[0] <= mfma_hs_max) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if ((Q->ne[0] <= 512 && Q->ne[0] > 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
