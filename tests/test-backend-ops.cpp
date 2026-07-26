@@ -8813,10 +8813,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Qwen3.6-27B M=2 target-verification shapes.
-    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_Q6_K}) {
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 2,  5120, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, 2, 17408, {1, 1}, {1, 1}));
+    // Qwen3.6-27B target-verification shapes. n_max 1/2/3 maps to N=2/3/4.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+        }
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -9694,6 +9696,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Exact small-N speculative-decode oracle for Qwen3.6-27B.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
 
     // gfx908 Qwen3.6 dense-matmul geometry oracle. These are the two
     // dominant FFN matrix shapes from the 27B model. Keep this compact so
