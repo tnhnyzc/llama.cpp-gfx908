@@ -298,10 +298,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                     return ne11 <= 3;
                 case GGML_TYPE_Q4_K:
                     return ne11 <= 2;
-                case GGML_TYPE_Q5_K:
-                    return ne11 <= 3;
-                case GGML_TYPE_Q6_K:
-                    return ne11 <= 4;
+                case GGML_TYPE_Q5_K: {
+                    const char * max_mmvq = std::getenv("GGML_HIP_MMVQ_MAX_Q5_K_GFX908");
+                    return ne11 <= (max_mmvq != nullptr ? std::atoi(max_mmvq) : 3);
+                }
+                case GGML_TYPE_Q6_K: {
+                    const char * max_mmvq = std::getenv("GGML_HIP_MMVQ_MAX_Q6_K_GFX908");
+                    return ne11 <= (max_mmvq != nullptr ? std::atoi(max_mmvq) : 4);
+                }
                 case GGML_TYPE_IQ4_NL: {
                     const char * force_mmq_m2 = std::getenv("GGML_HIP_IQ4_NL_MMQ_M2_GFX908");
                     return force_mmq_m2 != nullptr && std::atoi(force_mmq_m2) != 0
