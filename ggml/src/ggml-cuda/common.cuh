@@ -481,6 +481,50 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
     return x;
 }
 
+template<int n, int width = WARP_SIZE>
+static __device__ __forceinline__ void warp_reduce_sum_n(float * x) {
+#if defined(CDNA1)
+    if constexpr (width == 64) {
+        // Interleave independent accumulators at each DPP stage. Reducing
+        // them one at a time makes clang serialize six dependent DPP chains
+        // for MMVQ N=3 and insert latency-padding NOPs between every stage.
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x0b1>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x04e>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x124>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x128>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x142>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x143>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] = __shfl_sync(0xffffffff, x[i], 63, 64);
+        }
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        x[i] = warp_reduce_sum<width>(x[i]);
+    }
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
 #pragma unroll

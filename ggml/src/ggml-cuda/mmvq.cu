@@ -708,11 +708,30 @@ static __global__ void mul_mat_vec_q(
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
+#if defined(CDNA1)
+    if constexpr (!has_fusion && ncols_dst > 1) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+                for (int l = 0; l < nwarps-1; ++l) {
+                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                }
+            }
+        }
+        warp_reduce_sum_n<ncols_dst*rows_per_cuda_block, warp_size>(&tmp[0][0]);
+    }
+#endif
+
     // sum up partial sums and write back result
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
+#if defined(CDNA1)
+            if constexpr (has_fusion || ncols_dst == 1) {
+#endif
 #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
@@ -723,6 +742,9 @@ static __global__ void mul_mat_vec_q(
                 }
             }
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+#if defined(CDNA1)
+            }
+#endif
             if constexpr (has_fusion) {
                 if (use_gate) {
                     tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
