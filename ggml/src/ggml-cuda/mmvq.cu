@@ -1063,7 +1063,7 @@ static bool iq4_nl_n3_long_k_minwaves6_env() {
     return enabled;
 }
 
-static bool iq4_nl_n3_shared_unpack_env() {
+static bool iq4_nl_small_n_shared_unpack_env() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_HIP_IQ4_NL_N3_SHARED_UNPACK_GFX908");
         return env != nullptr && std::atoi(env) != 0;
@@ -1325,7 +1325,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 if (cc == GGML_CUDA_CC_CDNA1 && !has_fusion) {
                     const bool use_lb6 = ncols_x == 17408 && nrows_x == 5120 &&
                         iq4_nl_n3_long_k_minwaves6_env();
-                    const bool use_shared_unpack = iq4_nl_n3_shared_unpack_env();
+                    const bool use_shared_unpack = iq4_nl_small_n_shared_unpack_env();
                     if (use_lb6 && use_shared_unpack) {
                         mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, true, true>(
                             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -1360,6 +1360,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 4: {
             constexpr int c_ncols_dst = 4;
             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+            if constexpr (type == GGML_TYPE_IQ4_NL) {
+                const bool has_fusion =
+                    fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                    fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                if (cc == GGML_CUDA_CC_CDNA1 && !has_fusion &&
+                    iq4_nl_small_n_shared_unpack_env()) {
+                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, true>(
+                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        dims.first, dims.second, 0, ids_stride, stream);
+                    break;
+                }
+            }
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
