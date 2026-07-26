@@ -436,6 +436,30 @@ void launch_mul_mat_vec_f_cuda(
     if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
         max_block_size = 128;
     }
+    // gfx908: the launch is one workgroup per row, so a small nrows leaves the GPU
+    // idle. Qwen3.6's GDN gate/beta projections are F32 [5120,48] -- 48 workgroups
+    // x 128 threads = 96 waves over 120 CUs = 0.8 waves/CU, and they measure
+    // 61 GB/s (13x off ceiling) while being 3.0% of decode. When there are too few
+    // row-blocks to fill the device, let each row use a bigger block instead.
+    {
+        const int64_t row_blocks = nrows * nchannels_dst * nsamples_or_ntokens;
+        const int64_t n_cu       = ggml_cuda_info().devices[device].nsm;
+        // the switch below only instantiates up to 256 (default: GGML_ABORT)
+        // Measured on Qwen3.6-27B (GDN gate/beta projections are F32 [5120,48]):
+        // in-situ kernel 11.53 -> 7.30 us (1.58x), its share of traced kernel time
+        // 4.07% -> 2.62%. llama-bench TG (ncols=1, ~0 ctx) +0.89%. At the 14-21k
+        // context production runs it is ~0, because FA and KV reads dominate there
+        // and these projections are a small share. Kept because 48 workgroups on
+        // 120 CUs is simply wrong, and it cannot hurt.
+        // GGML_HIP_MMVF_WIDE=0 restores the old 128-thread cap.
+        static const bool wide_ok = [] {
+            const char * e = getenv("GGML_HIP_MMVF_WIDE");
+            return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+        }();
+        if (wide_ok && row_blocks < 4*n_cu && ncols >= 1024) {
+            max_block_size = 256;
+        }
+    }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
         const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
         if (niter < niter_best) {

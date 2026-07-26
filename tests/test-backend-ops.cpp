@@ -9709,6 +9709,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // decode shapes: n=3 is production MTP (2 draft + 1)
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                             GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int n : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, n, 5120,  {1,1}, {1,1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120,  n, 17408, {1,1}, {1,1}));
+        }
+    }
+
+    // Qwen3.6 GDN gate/beta projections, held in F32: [5120,48] and [10240,4].
+    // One workgroup per row means 48 row-blocks on 120 CUs -> 0.8 waves/CU.
+    for (int n : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48,    n, 5120,  {1,1}, {1,1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4,     n, 10240, {1,1}, {1,1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 48,    n, 5120,  {1,1}, {1,1}));
+    }
+
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
     uint32_t                        kwh_idx  = 1;
