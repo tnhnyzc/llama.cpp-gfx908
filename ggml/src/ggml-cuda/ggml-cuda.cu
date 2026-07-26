@@ -2323,7 +2323,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    static const bool q5_k_mmq_n3_gfx908 =
+        getenv("GGML_HIP_Q5_K_MMQ_N3_GFX908") != nullptr;
+    const bool q5_k_mmq_n3_shape =
+        cc == GGML_CUDA_CC_CDNA1 && src0->type == GGML_TYPE_Q5_K && ne11 == 3 &&
+        ((ne00 == 5120 && ne01 == 10240) || (ne00 == 6144 && ne01 == 5120));
+
+    if (!(q5_k_mmq_n3_gfx908 && q5_k_mmq_n3_shape) &&
+        ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
