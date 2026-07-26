@@ -9706,6 +9706,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
         }
     }
+    // Q5_K is used by the IQ4_NL model for GDN/attention projections rather
+    // than FFN weights. Preserve all three production shapes explicitly.
+    for (int n : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+    }
 
     // gfx908 Qwen3.6 dense-matmul geometry oracle. These are the two
     // dominant FFN matrix shapes from the 27B model. Keep this compact so
