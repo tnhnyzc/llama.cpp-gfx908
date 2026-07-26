@@ -458,6 +458,15 @@ static __device__ __forceinline__ float ggml_hip_move_dpp_f32(float x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#pragma unroll
+    for (int offset = width/2; offset > 0; offset >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+    }
+    return x;
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ float warp_reduce_sum_dpp(float x) {
 #if defined(CDNA1)
     if constexpr (width == 64) {
         // Keep the reduction in the VALU/DPP path. The generic HIP shuffle
@@ -474,11 +483,7 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
         return __shfl_sync(0xffffffff, x, 63, 64);
     }
 #endif
-#pragma unroll
-    for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
-    }
-    return x;
+    return warp_reduce_sum<width>(x);
 }
 
 template<int n, int width = WARP_SIZE>

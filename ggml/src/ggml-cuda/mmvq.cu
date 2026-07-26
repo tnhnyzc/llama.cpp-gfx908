@@ -741,7 +741,15 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+#if defined(CDNA1)
+            if constexpr (!has_fusion) {
+                tmp[j][i] = warp_reduce_sum_dpp<warp_size>(tmp[j][i]);
+            } else {
+                tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            }
+#else
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+#endif
 #if defined(CDNA1)
             }
 #endif
