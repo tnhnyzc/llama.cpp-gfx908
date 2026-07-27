@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -921,6 +922,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+    int32_t         n_layer_tgt        = 0;       // layer-count id means pre-final-norm state
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -978,13 +980,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
-        // turn on extraction of the target layers' input embeddings
+        // Laguna's final extraction id equals the target layer count and means
+        // the pre-final-norm residual stream, exposed by the unmasked nextn path.
+        n_layer_tgt = llama_model_n_layer(model_tgt);
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            if (target_layer_ids[k] == n_layer_tgt) {
+                llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            } else {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+            }
         }
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-        llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
+
+        bool causal = false;
+        {
+            char buf[32] = {};
+            if (llama_model_meta_val_str(model_dft, "dflash.decoder_arch", buf, sizeof(buf)) >= 0) {
+                causal = strcmp(buf, "laguna") == 0;
+            }
+        }
+        llama_set_causal_attn(ctx_dft, causal);
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1053,7 +1069,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    const float * layer = target_layer_ids[k] == n_layer_tgt
+                        ? llama_get_embeddings_nextn(ctx_tgt)
+                        : llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }

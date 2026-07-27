@@ -172,6 +172,9 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
+        // Residual-stream capture for DFlash and other feature-based drafters.
+        res->t_layer_inp[il] = inpL;
+
         const bool    is_swa_il   = hparams.is_swa(il);
         const int64_t n_head_il   = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
@@ -261,7 +264,9 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_o_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        // Unmasked nextn extraction needs every final-layer row until the
+        // pre-final-norm residual has been captured below.
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -321,7 +326,16 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     cur = inpL;
+
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

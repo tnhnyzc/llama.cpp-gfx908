@@ -1261,6 +1261,13 @@ struct llama_model_dflash : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // Laguna drafters use causal block attention, normalized target features,
+    // normalized injected K/V, and gated attention output.
+    bool decoder_laguna = false;
+
+    // Stacked per-feature RMSNorm weights [n_embd, n_aux].
+    ggml_tensor * aux_norm = nullptr;
+
     template <bool is_enc>
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
