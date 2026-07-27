@@ -9552,6 +9552,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
+    // Qwen3.6-27B full-attention decode shape: D=256, 24 query heads,
+    // 4 KV heads (GQA ratio 6), one token, and production-relevant K/V types.
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int kv : {8192, 32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, kv, 1, true, false,
+                0, 0, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -9601,6 +9611,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(
         GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 5120, 17408,
         false, 1, 1, false, false, true, false, {1, 1}));
+
+    // Production Qwen3.6 ordinary N=1 MMVQ shapes on gfx908.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
@@ -9736,6 +9760,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 type_a, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
         }
     }
+
+    // Exact ordinary (non-GLU) N=1 matrix shapes observed in the production
+    // Qwen3.6-27B IQ4_NL graph. Together with the fused FFN shapes above,
+    // these cover the hot MMVQ calls seen in the decode trace.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1}));   // attn_gate
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1}));  // attn_q
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));    // attn_qkv
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));     // ssm_out
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));     // attn_v
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));   // output
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
@@ -9940,6 +9980,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int nr : { 1, 4, }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             }
+        }
+    }
+
+    // Qwen3.6-27B full-attention decode depth oracle.
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int kv : {8192, 32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, kv, 1, true, false,
+                0, 0, GGML_PREC_F32, kv_type, kv_type));
         }
     }
 
