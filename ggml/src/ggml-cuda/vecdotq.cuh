@@ -1002,6 +1002,23 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(CDNA1)
+    // Q5_K packs four low scale/min bytes followed by four bytes containing
+    // the high scale/min values and their two upper bits. Decode both halves
+    // without a lane-divergent branch: on wave64, the j < 2 and j >= 2 lane
+    // groups otherwise make the wave execute both dependent extraction paths.
+    const uint32_t * scales32 = (const uint32_t *)bq5_K->scales;
+    const uint32_t scales_lo = scales32[0] & 0x3f3f3f3f;
+    const uint32_t mins_lo   = scales32[1] & 0x3f3f3f3f;
+    const uint32_t scales_hi = (scales32[2] & 0x0f0f0f0f) | ((scales32[0] >> 2) & 0x30303030);
+    const uint32_t mins_hi   = ((scales32[2] >> 4) & 0x0f0f0f0f) | ((scales32[1] >> 2) & 0x30303030);
+    const uint32_t hi_mask   = 0U - uint32_t(j >> 1);
+    const uint32_t shift     = 16U * uint32_t(j & 1);
+    const uint32_t scales_j  = (scales_lo ^ ((scales_lo ^ scales_hi) & hi_mask)) >> shift;
+    const uint32_t mins_j    = (mins_lo   ^ ((mins_lo   ^ mins_hi)   & hi_mask)) >> shift;
+    aux[0] = uint16_t(scales_j);
+    aux[1] = uint16_t(mins_j);
+#else
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -1009,6 +1026,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
