@@ -1035,16 +1035,16 @@ static constexpr bool mmvq_rows_override_type_supported(ggml_type type) {
     }
 }
 
-// gfx908/CDNA1, ncols_dst=1 only: 2 rows per block measured +1.6% (IQ4_NL) and
-// +3.1% (Q6_K) on n=1 decode. ncols_dst>1 already gets 2 from the GCN table and
-// showed no further gain, so it is deliberately left alone.
-// Set GGML_HIP_MMVQ_ROWS_GFX908=1 to restore upstream behaviour.
-static int mmvq_rows_override_env() {
-    static const int rows = []() {
-        const char * env = std::getenv("GGML_HIP_MMVQ_ROWS_GFX908");
-        return env != nullptr ? std::atoi(env) : 2;
-    }();
-    return rows;
+// gfx908/CDNA1, ncols_dst=1 only. Rows=2 is the qualified default for most
+// daily-model quant types, but Q5_K is consistently 3-5% faster with the
+// upstream one-row geometry. Keep the environment variable as an explicit
+// global override for regression testing and rollback.
+static int mmvq_rows_override(ggml_type type) {
+    static const char * env = std::getenv("GGML_HIP_MMVQ_ROWS_GFX908");
+    if (env != nullptr) {
+        return std::atoi(env);
+    }
+    return type == GGML_TYPE_Q5_K ? 1 : 2;
 }
 
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
@@ -1263,7 +1263,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             } else {
                 const int rows_override = mmvq_rows_override_type_supported(type) &&
-                    cc == GGML_CUDA_CC_CDNA1 ? mmvq_rows_override_env() : 0;
+                    cc == GGML_CUDA_CC_CDNA1 ? mmvq_rows_override(type) : 0;
                 std::pair<dim3, dim3> dims;
                 if (rows_override > 1) {
                     const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
