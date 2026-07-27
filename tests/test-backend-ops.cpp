@@ -9561,6 +9561,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 0, 0, GGML_PREC_F32, kv_type, kv_type));
         }
     }
+    for (int nb : {2, 3, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            256, 256, 4, {6, 1}, 32768, nb, true, false,
+            0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -9989,6 +9994,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(
                 256, 256, 4, {6, 1}, kv, 1, true, false,
                 0, 0, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
+    for (int nb : {2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16}) {
+        for (int kv : {32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, kv, nb, true, false,
+                0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
     }
 
