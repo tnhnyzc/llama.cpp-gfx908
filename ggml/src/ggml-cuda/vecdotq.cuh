@@ -1375,7 +1375,11 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
-#define VDR_IQ4_NL_Q8_1_MMVQ 2
+// One gfx908 thread consumes the whole 16-byte IQ4_NL block. This changes the
+// N=1 MMVQ load from two 8-byte pieces to one 16-byte transaction per thread.
+// Keep the change scoped to IQ4_NL; other quant layouts need independent
+// geometry qualification.
+#define VDR_IQ4_NL_Q8_1_MMVQ 4
 #define VDR_IQ4_NL_Q8_1_MMQ  4
 
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
@@ -1387,7 +1391,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 
     int sumi = 0;
 #pragma unroll
-    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
@@ -1412,7 +1416,7 @@ static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_m2(
     int sumi_0 = 0;
     int sumi_1 = 0;
 #pragma unroll
-    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
