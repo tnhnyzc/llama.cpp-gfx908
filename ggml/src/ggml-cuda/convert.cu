@@ -1,4 +1,16 @@
 #include "convert.cuh"
+
+#if defined(GGML_USE_HIP)
+#include <cstdlib>
+// Opt-out switch for the wave64 dequant path: GGML_HIP_DEQUANT_WAVE64=0.
+static bool ggml_cuda_dequant_wave64() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_DEQUANT_WAVE64");
+        return env == nullptr || !(env[0] == '0' && env[1] == '\0');
+    }();
+    return enabled;
+}
+#endif
 #include "dequantize.cuh"
 
 #include <cstdint>
@@ -108,6 +120,33 @@ static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t
         y[l+16] = ggml_cuda_cast<dst_t>(d * (q[l] >>  4) + dm);
     }
 }
+
+#if defined(GGML_USE_HIP)
+template<typename dst_t>
+static __global__ void dequantize_block_q4_0_w64(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 int nb32, int64_t nblk) {
+    const int64_t i = (int64_t) blockIdx.x*2 + (threadIdx.x >> 5);
+    if (i >= nblk) {
+        return;
+    }
+    const int64_t tid = threadIdx.x & 31;
+    const int64_t il  = tid/8;
+    const int64_t ir  = tid%8;
+    const int64_t ib  = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+    const block_q4_0 * x = (const block_q4_0 *)vx + ib;
+    const float d  = __half2float(x->d);
+    const float dm = -8*d;
+    const uint8_t * q = x->qs + 4*il;
+    for (int l = 0; l < 4; ++l) {
+        y[l+ 0] = ggml_cuda_cast<dst_t>(d * (q[l] & 0xF) + dm);
+        y[l+16] = ggml_cuda_cast<dst_t>(d * (q[l] >>  4) + dm);
+    }
+}
+#endif
 
 template<typename dst_t>
 static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
@@ -229,6 +268,44 @@ static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst
     dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
+#if defined(GGML_USE_HIP)
+// gfx908 and every other CDNA/GCN part is wave64, so a 32-thread workgroup
+// leaves half of each wavefront idle. The dequant kernels are purely
+// memory-bound (measured ~415 GB/s against ~861 GB/s achievable for a
+// read+write stream), so those idle lanes cost real bandwidth.
+// Same work, two QK_K blocks per 64-thread workgroup.
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_nl_w64(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                   const int64_t nb) {
+    const int64_t i = (int64_t) blockIdx.x*2 + (threadIdx.x >> 5);
+    if (i >= nb) {
+        return;
+    }
+    dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x & 31);
+}
+
+// Every one of these kernels has the identical shape
+//     i = blockIdx.x;  dequantize_X(vx, i, yy + i*QK_K, threadIdx.x);
+// with a 32-thread launch, so one macro covers them all.
+#define GGML_HIP_DEQUANT_W64(NAME)                                                 \
+template<typename dst_t>                                                           \
+static __global__ void dequantize_block_##NAME##_w64(                              \
+        const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) { \
+    const int64_t i = (int64_t) blockIdx.x*2 + (threadIdx.x >> 5);                 \
+    if (i >= nb) { return; }                                                       \
+    dequantize_##NAME(vx, i, yy + i*QK_K, threadIdx.x & 31);                       \
+}
+
+GGML_HIP_DEQUANT_W64(iq2_xxs)
+GGML_HIP_DEQUANT_W64(iq2_xs)
+GGML_HIP_DEQUANT_W64(iq2_s)
+GGML_HIP_DEQUANT_W64(iq3_xxs)
+GGML_HIP_DEQUANT_W64(iq3_s)
+GGML_HIP_DEQUANT_W64(iq1_s)
+GGML_HIP_DEQUANT_W64(iq4_xs)
+GGML_HIP_DEQUANT_W64(mxfp4)
+#endif
+
 template<typename dst_t>
 static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
@@ -286,6 +363,12 @@ template<typename dst_t>
 static void dequantize_row_q4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb32 = k / 32;
     const int nb = (k + 255) / 256;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_q4_0_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb32, nb);
+        return;
+    }
+#endif
     dequantize_block_q4_0<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
@@ -317,42 +400,84 @@ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq2_xxs_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq2_xs_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq2_s_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq3_xxs_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq3_s_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq1_s_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq1_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq4_nl_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -365,12 +490,24 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_iq4_xs_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_dequant_wave64()) {
+        dequantize_block_mxfp4_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        return;
+    }
+#endif
     dequantize_block_mxfp4<<<nb, 32, 0, stream>>>(vx, y);
 }
 
