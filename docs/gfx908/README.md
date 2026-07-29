@@ -78,20 +78,26 @@ whole-model no-spec TG by approximately 2-4%. This path does not depend on MTP.
 ## Model-level anchors
 
 These model-level measurements combine `llama-bench` and daily server results.
-They include backend and configuration changes, so they should not be read as
-the effect of one kernel.
+Arrows show the relevant baseline and measured result, including configuration
+changes where noted.
 
-| Model | Baseline | Measured results | Summary |
-|---|---|---|---|
-| Qwen3.6-27B Q6_K | PP about 714 tok/s with default ubatch; shallow no-spec TG about 27 tok/s; MTP service baseline 40.55 tok/s | favorable service PP 1.3-1.4k; low-context MTP 50-52 tok/s | Large PP gain; practical MTP gain about +23-28%; smaller shallow no-spec TG gain |
-| Qwen3.6-27B IQ4_NL | PP about 712 tok/s; shallow no-spec TG about 36.7 tok/s; MTP service baseline 51.07 tok/s | favorable service PP about 1.4k; low-context MTP 58-61 tok/s | Fastest resident 27B profile; practical MTP gain about +14-19%; TG varies with context and acceptance |
-| Gemma4-31B, Q4_0-based | server PP 459.7 tok/s; pp4096 510.1 tok/s; shallow TG 45.55 tok/s | pp4096 1078.3, pp8192 1047.1 and pp32768 751.4 tok/s; real 20k-token prefill 757.4 tok/s; shallow TG 45-46.5 tok/s | CDNA1 batch routing roughly doubled direct prefill while preserving shallow TG |
-| GPT-OSS-120B, CPU-offloaded MXFP4 MoE | 23.2 TG on upstream | 35.7 TG in the matched A/B; typically 36-38 warm | +54% in the matched test; CPU placement and contention remain relevant |
-| Step-3.7-Flash, heavily offloaded | 14.7 TG | 16.9 TG in the matched A/B; typically 17-18 warm | About +15%; storage and CPU traffic limit the GPU-side gain |
+| Model | Prefill | Generation |
+|---|---|---|
+| Qwen3.6-27B Q6_K | about 714 → 1.3-1.4k tok/s | no-spec baseline about 27 tok/s; MTP 40.55 → 50-52 tok/s |
+| Qwen3.6-27B IQ4_NL | about 712 → 1.4k tok/s | no-spec baseline about 36.7 tok/s; MTP 51.07 → 58-61 tok/s |
+| Gemma4-31B, Q4_0-based | pp4096 510.1 → 1078.3 tok/s; real 20k-token prefill 757.4 tok/s | 45-46.5 tok/s shallow; 37.5 tok/s after the 20k prefill |
+| GPT-OSS-120B, CPU-offloaded MXFP4 MoE | — | 23.2 → 35.7 tok/s matched; typically 36-38 tok/s warm |
+| Step-3.7-Flash, heavily offloaded | — | 14.7 → 16.9 tok/s matched; typically 17-18 tok/s warm |
 
-The Qwen rows compare the upstream default invocation with tuned daily-use
-settings. They show practical end-to-end performance, while the matched
-code-level comparisons remain in [BENCHMARKS.md](BENCHMARKS.md).
+Gemma4 also measured 1047.1 tok/s at pp8192 and 751.4 tok/s at pp32768. Its
+CDNA1 batch-routing change roughly doubled direct prefill while preserving
+shallow TG. GPT-OSS and Step are CPU-offloaded, so storage placement and CPU
+contention remain part of their end-to-end results.
+
+The Qwen prefill rows compare the upstream default invocation with tuned
+daily-use settings. The MTP arrows are practical service comparisons with
+different prompts and acceptance rates. Matched code-level comparisons remain
+in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Start here
 
