@@ -6,6 +6,8 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <cstdio>
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -158,6 +160,61 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
+            // gfx908: the ncols1/ncols2 heuristic carries explicit NVIDIA
+            // carve-outs, so allow the tile shape to be pinned for measurement.
+            // Format "ncols1,ncols2"; only combinations actually instantiated for
+            // 256/256 are honoured, anything else falls through to the heuristic.
+            if (const char * fattn_env = getenv("GGML_HIP_FATTN_NCOLS_256")) {
+                int n1 = 0, n2 = 0;
+                if (sscanf(fattn_env, "%d,%d", &n1, &n2) == 2) {
+#define GGML_HIP_FATTN_TRY(N1, N2)                                                         \
+                    if (n1 == (N1) && n2 == (N2)) {                                        \
+                        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, N1, N2>(ctx, dst);  \
+                        break;                                                             \
+                    }
+                    GGML_HIP_FATTN_TRY( 1, 8)
+                    GGML_HIP_FATTN_TRY( 2, 4)
+                    GGML_HIP_FATTN_TRY( 2, 8)
+                    GGML_HIP_FATTN_TRY( 4, 2)
+                    GGML_HIP_FATTN_TRY( 4, 4)
+                    GGML_HIP_FATTN_TRY( 4, 8)
+                    GGML_HIP_FATTN_TRY( 8, 1)
+                    GGML_HIP_FATTN_TRY( 8, 2)
+                    GGML_HIP_FATTN_TRY( 8, 4)
+                    GGML_HIP_FATTN_TRY( 8, 8)
+                    GGML_HIP_FATTN_TRY(16, 1)
+                    GGML_HIP_FATTN_TRY(16, 2)
+                    GGML_HIP_FATTN_TRY(16, 4)
+                    GGML_HIP_FATTN_TRY(32, 1)
+                    GGML_HIP_FATTN_TRY(32, 2)
+                    GGML_HIP_FATTN_TRY(64, 1)
+#undef GGML_HIP_FATTN_TRY
+                }
+            }
+#if defined(GGML_USE_HIP)
+            // gfx908, long context: the upstream heuristic picks ncols1=8,ncols2=8
+            // for this head size, which is tuned for short prompts. Flash attention
+            // is quadratic in KV length, so it grows from ~10% of prefill at 8k
+            // context to ~26% at 32k -- and in that regime a taller, narrower tile
+            // wins. Measured (Qwen3.6-27B IQ4_NL, pp = KV length):
+            //     4k   1463.6 -> 1466.8   (+0.2%)
+            //     8k   1499.7 -> 1491.4   (-0.6%)
+            //    32k   1138.8 -> 1199.1   (+5.3%)
+            //    64k    912.8 ->  995.1   (+9.0%)
+            // Neutral below the threshold, so only switch where it was measured to
+            // help. GGML_HIP_FATTN_LONGCTX_GFX908=0 disables.
+            {
+                static const bool longctx_enabled = [] {
+                    const char * e = getenv("GGML_HIP_FATTN_LONGCTX_GFX908");
+                    return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+                }();
+                const int cc_local = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                if (longctx_enabled && cc_local == GGML_CUDA_CC_CDNA1 && K->ne[1] >= 8192) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2>(ctx, dst);
+                    break;
+                }
+            }
+#endif
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);
             break;
         case 320:
@@ -178,6 +235,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 512:
             GGML_ASSERT(V->ne[0] == 512);
+#if defined(GGML_USE_HIP)
+            // Same long-context question as head-dim 256 (see above). Gemma4 mixes
+            // 512- and 256-wide attention, so its global-attention layers land here.
+            if (const char * fattn_env = getenv("GGML_HIP_FATTN_NCOLS_512")) {
+                int n1 = 0, n2 = 0;
+                if (sscanf(fattn_env, "%d,%d", &n1, &n2) == 2) {
+#define GGML_HIP_FATTN_TRY512(N1, N2)                                                      \
+                    if (n1 == (N1) && n2 == (N2)) {                                        \
+                        ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, N1, N2>(ctx, dst);  \
+                        break;                                                             \
+                    }
+                    GGML_HIP_FATTN_TRY512( 4, 2)
+                    GGML_HIP_FATTN_TRY512( 8, 2)
+                    GGML_HIP_FATTN_TRY512( 8, 4)
+                    GGML_HIP_FATTN_TRY512( 8, 8)
+                    GGML_HIP_FATTN_TRY512(16, 2)
+                    GGML_HIP_FATTN_TRY512(16, 4)
+                    GGML_HIP_FATTN_TRY512(32, 2)
+#undef GGML_HIP_FATTN_TRY512
+                }
+            }
+#endif
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
             break;
         case 576: {
@@ -509,14 +588,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
-    if ((amd_mfma_available(cc) && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    // gfx908 experiment: the <=256 bound means head-dim 512 (Gemma4's global-attention
+    // layers) can never reach MMA and always falls through to the tile kernel. Raise the
+    // bound to 512 behind an env gate to find out whether MMA is actually better there.
+    // NOTE: this also invalidates the A29 "head-dim 512 tile sweep" -- that override sits
+    // inside the dispatch switch, which is only reached once MMA has been selected, so it
+    // never fired and all three of its measurements were the tile kernel.
+    // Measured on gfx908 with Gemma4-31B (mixed 512/256 head dims), thermally
+    // gated, both orders: pp8192 1012.9 -> 1047.1 (+3.4%), pp32768 612.2 ->
+    // 751.4 (+22.7%). TG neutral. FLASH_ATTN_EXT 0 failures. The gain grows with
+    // context because FA's share of prefill does.
+    // Set GGML_HIP_FATTN_MMA_HS512=0 to restore the upstream <=256 bound.
+    static const int64_t mfma_hs_max = [] {
+        const char * e = getenv("GGML_HIP_FATTN_MMA_HS512");
+        return (e && e[0] == '0' && e[1] == '\0') ? 256 : 512;
+    }();
+    if ((amd_mfma_available(cc) && Q->ne[0] <= mfma_hs_max) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if ((Q->ne[0] <= 512 && Q->ne[0] > 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if ((Q->ne[0] <= 64 && Q->ne[1] * gqa_ratio_eff > 8)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
         if ((Q->ne[0] <= 128 && Q->ne[1] * gqa_ratio_eff > 16)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
-        if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > 64)) {
+        // The >64 bound means MTP decode (Q->ne[1]=3, gqa_ratio 5-6 -> 15-18) never
+        // reaches MMA and stays on flash_attn_tile no matter how deep the KV is.
+        // The selector looks at effective query width but not KV depth, and FA's
+        // share of decode grows with depth. Tunable so that can be measured.
+        static const int64_t decode_thresh = [] {
+            const char * e = getenv("GGML_HIP_FATTN_MMA_DECODE_THRESH");
+            // Default 8 on CDNA1 (this branch is amd_mfma only): MTP decode is
+            // Q->ne[1]=3 x gqa 5-6 = 15-18, so the upstream 64 kept it on
+            // flash_attn_tile at every KV depth. Measured Qwen3.6-27B-Fast with
+            // greedy sampling (acceptance matched): ~21k +0.15%, ~32k +1.58% TG.
+            // The gain grows with depth because FA's share of decode does.
+            return e ? (int64_t) atoll(e) : (int64_t) 8;
+        }();
+        if ((Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff > decode_thresh)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
     }

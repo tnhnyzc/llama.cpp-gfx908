@@ -74,9 +74,11 @@ static __global__ void flash_attn_ext_vec(
 #ifdef GGML_USE_HIP
 #ifdef RDNA
     constexpr int nthreads_KQ_q = 2;
+#elif defined(CDNA1)
+    constexpr int nthreads_KQ_q = 8;
 #else
     constexpr int nthreads_KQ_q = 4;
-#endif // RDNA
+#endif
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #else
     constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);

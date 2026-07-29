@@ -1100,7 +1100,26 @@ template<int DV, int ncols> struct mma_tile_sizes {
     using T_C_KQ  = tile<16, 16, float>; // column-major
     using T_A_VKQ = tile<16,  8, half2>; // row-major
     using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    // CDNA has no f16-accumulate MFMA: v_mfma_f32_16x16x16f16 produces f32. A
+    // half2 accumulator therefore cannot be a native output, and mma.cuh has to
+    // wrap every single VKQ MFMA in 8 conversions (4 f16->f32 in, 4 f32->f16
+    // out) -- see the "convert back to half2" path there. It also rounds the
+    // accumulator to f16 after every instruction instead of carrying f32 across
+    // the K loop, which is strictly worse numerically.
+    //
+    // tile<16,16,float> hits the native overload (floatx4 accumulator, no
+    // conversions). The kernel already supports a float VKQ accumulator -- the
+    // branches at the KQ_max rescale below are written for both, and the RDNA3
+    // path already uses float for DV=80/112.
+    //
+    // But it is not a free win: a float tile is ne=4 (4 VGPRs) where the half2
+    // tile is ne=2 (2 VGPRs) for the same values, so at DV=256 it costs ~32 more
+    // VGPRs. Prefill is compute-bound and the removed conversions dominate;
+    // decode is latency-bound and wants the occupancy instead. Measured on a
+    // real 27891-token request: float everywhere gave PP +4.77% but TG -2.55%.
+    // Gate it on ncols so the large prefill tiles (deployed config is
+    // ncols1=32 x ncols2=2 = 64) take f32 and the small decode tiles keep half2.
+    using T_C_VKQ = std::conditional_t<(ncols >= 32), tile<16, 16, float>, tile<16, 8, half2>>; // column-major
 };
 #else // Volta
 template<int DV, int ncols> struct mma_tile_sizes {
@@ -1179,12 +1198,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
+    // A half2 C tile stores 2 values per J, so its value-width is 2*J; a float
+    // C tile's value-width is just J. The mma loop below indexes VKQ_C by
+    // i_VKQ_0/T_A_VKQ::I and so always needs DV/16 tiles -- sizing a float tile
+    // with the 2*J rule allocates half of that and corrupts memory. The RDNA3
+    // branch already encodes this: its DV/T_C_VKQ::J case is exactly DV=80/112,
+    // the two head sizes that use a float accumulator.
+    static constexpr bool vkq_is_float = std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>;
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
     T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[vkq_is_float       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #else // Volta
     T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
@@ -1766,7 +1792,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_WMMA_AVAILABLE)
 
 #if defined(AMD_MFMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || DKQ > 512) {
         NO_DEVICE_CODE;
         return;
     }
