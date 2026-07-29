@@ -28,7 +28,7 @@ static gdn_chunk_gfx908_modules & get_gdn_chunk_gfx908_modules() {
         const char * env_dir = std::getenv("GGML_HIP_GDN_CHUNK_GFX908_DIR");
         const std::string dir = env_dir != nullptr
             ? env_dir
-            : "/home/llm/mi100/triton-gdn-gfx908-f16-vfirst-modulo";
+            : "triton-gdn-gfx908-f16-vfirst-modulo";
 
         const char * files[5] = {
             "chunk_local_cumsum_scalar_kernel.hsaco",
