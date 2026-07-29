@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -3024,10 +3026,18 @@ private:
 
         // generate the actual drafts (if any)
         {
+            const bool mtp_stage_timings = std::getenv("GGML_MTP_STAGE_TIMINGS") != nullptr;
+            const int64_t t_stage_start = mtp_stage_timings ? ggml_time_us() : 0;
             common_speculative_draft(spec.get());
+            if (mtp_stage_timings && ctx_dft) {
+                llama_synchronize(ctx_dft);
+                std::fprintf(stderr, "MTP_STAGE draft_us=%" PRId64 "\n", ggml_time_us() - t_stage_start);
+            }
         }
 
         // make checkpoints if needed
+        const bool mtp_stage_timings_checkpoint = std::getenv("GGML_MTP_STAGE_TIMINGS") != nullptr;
+        const int64_t t_checkpoint_start = mtp_stage_timings_checkpoint ? ggml_time_us() : 0;
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3036,14 +3046,25 @@ private:
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            const bool reuse_mtp_draft_prefix =
+                std::getenv("GGML_MTP_REUSE_DRAFT_PREFIX") != nullptr &&
+                params_base.speculative.draft.n_max == 1 &&
+                draft.size() == 1 &&
+                std::find(
+                    params_base.speculative.types.begin(),
+                    params_base.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() &&
+                !use_ckpt_dft;
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                if (!reuse_mtp_draft_prefix) {
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                        GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    }
                 }
             }
 
@@ -3074,6 +3095,9 @@ private:
                 }
             }
         });
+        if (mtp_stage_timings_checkpoint && !drafting.empty()) {
+            std::fprintf(stderr, "MTP_STAGE checkpoint_us=%" PRId64 "\n", ggml_time_us() - t_checkpoint_start);
+        }
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -3636,7 +3660,14 @@ private:
             }
         }
 
+        const bool mtp_stage_timings = std::getenv("GGML_MTP_STAGE_TIMINGS") != nullptr;
+        const int64_t t_target_start = mtp_stage_timings ? ggml_time_us() : 0;
         const int ret = llama_decode(ctx_tgt, batch_view);
+        if (mtp_stage_timings) {
+            llama_synchronize(ctx_tgt);
+            std::fprintf(stderr, "MTP_STAGE target_us=%" PRId64 " n_batch=%d\n",
+                    ggml_time_us() - t_target_start, batch_view.n_tokens);
+        }
 
         metrics.on_decoded(slots);
 
@@ -3693,7 +3724,14 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        const int64_t t_catchup_start = mtp_stage_timings ? ggml_time_us() : 0;
+        const bool speculative_process_ok = common_speculative_process(spec.get(), batch_view);
+        if (mtp_stage_timings && ctx_dft) {
+            llama_synchronize(ctx_dft);
+            std::fprintf(stderr, "MTP_STAGE catchup_us=%" PRId64 " n_batch=%d\n",
+                    ggml_time_us() - t_catchup_start, batch_view.n_tokens);
+        }
+        if (!speculative_process_ok) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -3843,6 +3881,8 @@ private:
         });
 
         // speculative decoding - main model sample and accept
+        const bool mtp_stage_timings_accept = std::getenv("GGML_MTP_STAGE_TIMINGS") != nullptr;
+        const int64_t t_accept_start = mtp_stage_timings_accept ? ggml_time_us() : 0;
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
                 return;
@@ -3966,6 +4006,9 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+        if (mtp_stage_timings_accept) {
+            std::fprintf(stderr, "MTP_STAGE accept_us=%" PRId64 "\n", ggml_time_us() - t_accept_start);
+        }
     }
 
     int get_slot_n_ctx() {
