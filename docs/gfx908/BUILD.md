@@ -52,6 +52,7 @@ falls back for other shapes.
 7. Deploy through a new build directory and retain the previous binary/config
    as the rollback target.
 
-The current branch is source-qualified but has not yet been rebuilt from this
-clean public history. The next MI100 session should perform that final
-reproducibility fence before replacing the existing daily build.
+The clean public history has been rebuilt successfully for the gfx908 target.
+It has not yet completed the hardware runtime and performance oracle on an
+MI100. The next MI100 session should perform that final reproducibility fence
+before replacing the existing daily build.
