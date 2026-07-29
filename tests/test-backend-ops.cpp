@@ -8844,6 +8844,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen3.6-27B target-verification shapes. n_max 1/2/3 maps to N=2/3/4.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -9604,6 +9612,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+    // Qwen3.6-27B full-attention decode shape: D=256, 24 query heads,
+    // 4 KV heads (GQA ratio 6), one token, and production-relevant K/V types.
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int kv : {8192, 32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, kv, 1, true, false,
+                0, 0, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
+    for (int nb : {2, 3, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            256, 256, 4, {6, 1}, 32768, nb, true, false,
+            0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -9645,6 +9668,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Production Qwen3.6 M=2 gate/up fusion shapes on gfx908.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 17408, 5120,
+        false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 5120, 17408,
+        false, 1, 1, false, false, true, false, {1, 1}));
+
+    // Production Qwen3.6 ordinary N=1 MMVQ shapes on gfx908.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {
@@ -9740,6 +9785,62 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Exact small-N speculative-decode oracle for Qwen3.6-27B.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
+
+    // gfx908 Qwen3.6 dense-matmul geometry oracle. These are the two
+    // dominant FFN matrix shapes from the 27B model. Keep this compact so
+    // CDNA MMQ geometry variants can be screened without full-model runs.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int n : {384, 448, 512, 768, 1024}) {
+            // ffn_gate / ffn_up: [k=5120, m=17408]
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            // ffn_down: [k=17408, m=5120]
+            test_cases.emplace_back(new test_mul_mat(
+                type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Decode shapes (n=1 mmvq, n=2 MTP). The perf list above starts at n=384,
+    // so the batch-1 path that dominates token generation was never measured
+    // here. These are the four real per-layer tensors of Qwen3.6-27B.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat(   // ffn_gate / ffn_up
+                type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(   // ffn_down
+                type_a, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(   // attn_q / attn_o
+                type_a, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(   // attn_k / attn_v
+                type_a, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Exact ordinary (non-GLU) N=1 matrix shapes observed in the production
+    // Qwen3.6-27B IQ4_NL graph. Together with the fused FFN shapes above,
+    // these cover the hot MMVQ calls seen in the decode trace.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1}));   // attn_gate
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1}));  // attn_q
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));    // attn_qkv
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));     // ssm_out
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));     // attn_v
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));   // output
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
@@ -9952,6 +10053,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int nr : { 1, 4, }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
             }
+        }
+    }
+
+    // Qwen3.6-27B full-attention decode depth oracle.
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int kv : {8192, 32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, kv, 1, true, false,
+                0, 0, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
+    for (int nb : {2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16}) {
+        for (int kv : {32768, 65536}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, kv, nb, true, false,
+                0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
     }
 
