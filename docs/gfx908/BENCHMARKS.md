@@ -18,19 +18,67 @@ Perplexity comparisons must use the same corpus, tokenization, chunk count,
 batch width and command line. Server figures are kept separate from
 `llama-bench` and direct-kernel measurements.
 
+## What the historical numbers mean
+
+There are two useful but different views of the project:
+
+1. The first retained upstream run records the out-of-box experience before any
+   gfx908 work. It used `llama-bench` defaults and is the honest historical
+   starting point.
+2. Later optimization work used larger explicit batch and ubatch settings. Those
+   runs isolate real improvements, but they cannot be arranged into a single
+   code-only speedup by comparing their absolute values with the default run.
+
+The final clean branch has been rebuilt for gfx908 but has not yet been rerun on
+MI100. Until that same-oracle rerun exists, this page deliberately does not show
+a synthetic "upstream to current" percentage.
+
 ## Original upstream baseline
 
-Initial matched oracle on Qwen3.6-27B, `-b 1024 -ub 1024`, Q8 K/V cache,
-flash attention, no speculation:
+The retained raw runs use upstream commit
+`e8e6c7af2456fd50bb62f7a2bbd642e6fb14ae77`, ROCm
+`7.15.0a20260720`, full GPU offload, flash attention and no speculation:
 
-| Quant | pp128 mean / warm | pp512 mean / warm | pp2048 | TG128 |
-|---|---:|---:|---:|---:|
-| Q6_K | 378 / ~403 | 699 / ~718.5 | 868.1 | 27.529 |
-| IQ4_NL | 584 / ~640.6 | 694.8 / ~712.7 | 859.9 | 35.564 |
+```text
+llama-bench -p 128,512,2048,8192 -n 128 -r 5 -ngl 999 -fa auto
+```
 
-MTP with one draft token raised the deterministic warm completion from 27.65
-to 40.81 tok/s for Q6_K and from 36.23 to 49.89 tok/s for IQ4_NL, with 93.8%
-and 96.9% acceptance respectively.
+| Quant | pp128 | pp512 | pp2048 | pp8192 | TG128 |
+|---|---:|---:|---:|---:|---:|
+| Q6_K | 383.98 ± 46.71 | 709.51 ± 30.69 | 714.00 ± 1.33 | 683.60 ± 2.53 | 26.70 ± 0.54 |
+| IQ4_NL | 617.80 ± 86.61 | 708.53 ± 31.85 | 712.30 ± 1.51 | 682.05 ± 2.84 | 36.65 ± 0.09 |
+
+These unexpectedly low PP values are real for that invocation. Later figures
+above 1,000 tok/s combine code improvements with deliberate batch/ubatch tuning,
+so the difference is not attributable to kernels alone. The archived console
+records are under [`benchmarks/gfx908/history`](../../benchmarks/gfx908/history/README.md).
+
+Early real-server MTP requests on the same upstream build reached 40.55 tok/s
+for Q6_K and 51.07 tok/s for IQ4_NL. These were individual service requests with
+different prompts and acceptance rates, not a matched no-spec/MTP oracle, and are
+therefore retained only as historical observations.
+
+## Short chronology
+
+The project moved through the following major turning points. Rows in the
+absolute-result column are retained measurements, but only arrows within one row
+are controlled comparisons. Rows that change ubatch are configuration gains.
+
+| Stage | Representative retained result | Interpretation |
+|---|---|---|
+| Upstream `e8e6c7af` | Q6/IQ4 pp2048: 714/712 tok/s | Historical default invocation |
+| Chunked recurrent prefill | Q6 +12.1% pp512, +19.3% pp2048 | Removed the dominant recurrent-prefill bottleneck |
+| Larger ubatch | IQ4 pp4096: 1027.5 → 1105.7 | +7.6% from ubatch 1024 → 2048 |
+| Exact rocBLAS solution selection | IQ4: 1112.45 → 1346.21; Q6: 1108.05 → 1345.42 | About +21% at pp4096, TG neutral |
+| Runtime GEMM autotuning | IQ4 pp4096: 1160.4 → 1445.9 | Same later build, autotuning globally off versus warm cache; overlaps the preceding row |
+| Tiled recurrent concat | Q6 pp4096: 1400.26 → 1440.22 | +2.9% isolated data-layout improvement |
+| ubatch 4096 | IQ4: 1444.80 → 1518.17; Q6: 1435.94 → 1531.11 | Additional PP at a material VRAM cost |
+| Later attention/decode work | See the isolated tables below | Mostly long-context PP/TG and quant-specific gains |
+| Current clean branch | Runtime result pending | Source reconstructed and compiled; MI100 rerun still required |
+
+This chronology is intentionally not summed. Controls overlap, several stages
+used different ubatches, and later attention/decode work affects different model
+shapes and context depths.
 
 ## Retained incremental results
 
@@ -72,6 +120,12 @@ Q4_K/Q5_K branchless metadata reconstruction:
 Qualification covered 22/22 Q5_K cases, 43/43 Q4_K cases, and 1164/1164
 ROCm `MUL_MAT` cases. The four-chunk Q4_K_M perplexity result was
 `14.3074 ± 1.21672` for control and `14.3131 ± 1.21708` for candidate.
+
+The 10.59% whole-model result belongs to the separate
+Qwen3.6-27B-Q4_K_M GGUF, where Q4_K and Q5_K account for 72.6% of weight bytes.
+That model was not referenced by the daily llama-swap profiles. On the served
+IQ4_NL model, Q5_K has a much smaller surface, so this number must not be carried
+over as the daily profile's expected gain.
 
 ## Deployment observations
 
