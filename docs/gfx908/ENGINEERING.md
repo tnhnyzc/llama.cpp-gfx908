@@ -33,8 +33,8 @@ Prompt processing and token generation required different work:
 - Profiler per-dispatch overhead materially inflated short-kernel durations.
   Corrected kernel time is kept separate from wall time and launch/sync gaps.
 
-These corrections are part of the result, not historical clutter: they explain
-why the current branch contains regression oracles and conservative guards.
+These corrections explain why the current branch includes focused regression
+tests and conservative guards.
 
 ## Current bottleneck map
 
@@ -64,7 +64,7 @@ why the current branch contains regression oracles and conservative guards.
 
 ## Highest-value future work
 
-1. Rebase the clean stack onto current upstream and re-establish the oracle.
+1. Rebase the clean stack onto current upstream and rerun the test matrix.
 2. Package the chunked GDN source/assets reproducibly.
 3. Compare CUDA and HIP with the same model, depth, speculation and profiler
    correction to isolate launch latency and memory-level parallelism.
@@ -72,10 +72,10 @@ why the current branch contains regression oracles and conservative guards.
    traces confirm repeated identical activation quantization can be reused.
 5. Continue the fused FP16-MFMA path by transplanting the block-owned quant
    decoder into a selected exact-shape Tensile-class schedule.
-6. Treat Vulkan as a later independent backend port using HIP as the oracle,
+6. Treat Vulkan as a later independent backend port using HIP as the reference,
    rather than assuming HIP tuning transfers automatically.
 
-## Evidence levels
+## How results are labeled
 
 - **Qualified:** correctness, same-lineage A/B, reversed order where needed,
   and whole-model validation completed.

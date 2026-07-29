@@ -1,9 +1,9 @@
 # Optimization status
 
-This file is the short source of truth for what is enabled, what must be opted
-into, and what should not be mistaken for a production result.
+This page lists what is enabled by default, what is optional, and what remains
+experimental.
 
-## Qualified defaults
+## Enabled defaults
 
 - CDNA1 wave64 dequantization for the covered quant types. Set
   `GGML_HIP_DEQUANT_WAVE64=0` to restore the upstream launch geometry.
@@ -22,12 +22,12 @@ into, and what should not be mistaken for a production result.
   `GGML_HIP_FATTN_MMA_DECODE_THRESH` remains available for crossover sweeps.
 - Q4_0/Q4_1/Q5_0/Q5_1 CDNA1 MMQ batch routing.
 
-## Opt-in production routes
+## Optional routes
 
 - `GGML_HIP_GEMM_AUTOTUNE_GFX908=1`: exact-shape rocBLAS solution tuning.
   Persist results with `GGML_HIP_GEMM_AUTOTUNE_CACHE=/path/to/cache.tsv`.
 - `GGML_HIP_IQ4_NL_FUSED_GFX908=1`: exact Qwen FFN IQ4_NL prefill route for
-  qualified M values. This is shape-specific, not a universal IQ4 kernel.
+  tested M values. This is shape-specific, not a universal IQ4 kernel.
 - `GGML_HIP_GDN_CHUNK_GFX908=1`: exact-shape chunked Qwen GDN prefill. Requires
   the external HSACO directory described in BUILD.md.
 - `GGML_HIP_Q5_K_MMQ_N3_GFX908=1`: exact Q5_K speculative-width route.
@@ -37,12 +37,12 @@ into, and what should not be mistaken for a production result.
 ## Measurement controls
 
 - `GGML_HIP_FATTN_NCOLS_256` and `GGML_HIP_FATTN_NCOLS_512` override FA tile
-  geometry for controlled sweeps; defaults are the qualified selectors.
+  geometry for controlled sweeps; defaults are the tested selectors.
 - `GGML_HIP_GEMM_AUTOTUNE_DEBUG=1` and
   `GGML_HIP_GDN_CHUNK_GFX908_DEBUG=1` enable diagnostic logging.
 - `GGML_HIP_CONCAT_TRANSPOSE_GFX908` controls the transposed concat path.
 
-## Not production claims
+## Experimental or rejected work
 
 - A standalone fused IQ4_NL FP16-MFMA feasibility kernel substantially reduced
   decode overhead but did not yet beat the selected Tensile schedule. It is not
@@ -63,7 +63,7 @@ into, and what should not be mistaken for a production result.
 - Package the chunked GDN kernel source and reproducible HSACO build process.
 - Add CI that at least compiles the HIP/gfx908 target; hardware performance CI
   is not currently available.
-- Rebase onto current upstream and repeat the complete oracle before changing
+- Rebase onto current upstream and repeat the full test matrix before changing
   the production branch.
 - Re-check generic paths touched by the old production tree and add explicit
   CDNA1 guards wherever the optimization is not intended for CUDA/RDNA.

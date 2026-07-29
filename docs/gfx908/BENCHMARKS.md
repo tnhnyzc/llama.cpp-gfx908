@@ -1,6 +1,6 @@
 # Benchmark and correctness record
 
-## Oracle rules
+## Test method
 
 Performance numbers are accepted only when the test records:
 
@@ -22,7 +22,7 @@ batch width and command line. Server figures are kept separate from
 
 There are two useful but different views of the project:
 
-1. The first retained upstream run records the out-of-box experience before any
+1. The first recorded upstream run shows the out-of-box experience before any
    gfx908 work. It used `llama-bench` defaults and is the honest historical
    starting point.
 2. Later optimization work used larger explicit batch and ubatch settings. Those
@@ -30,8 +30,8 @@ There are two useful but different views of the project:
    code-only speedup by comparing their absolute values with the default run.
 
 The final clean branch has been rebuilt for gfx908 but has not yet been rerun on
-MI100. Until that same-oracle rerun exists, this page deliberately does not show
-a synthetic "upstream to current" percentage.
+MI100 with identical settings. Until that run exists, this page does not invent
+a single "upstream to current" percentage from unlike tests.
 
 The practical endpoint is nevertheless meaningful: favorable 27B prefill moved
 from roughly 712-714 tok/s in the first stock run to roughly 1.3-1.5k tok/s over
@@ -41,7 +41,7 @@ separate their contributions without replacing this historical record.
 
 ## Original upstream baseline
 
-The retained raw runs use upstream commit
+The recorded raw runs use upstream commit
 `e8e6c7af2456fd50bb62f7a2bbd642e6fb14ae77`, ROCm
 `7.15.0a20260720`, full GPU offload, flash attention and no speculation:
 
@@ -60,7 +60,7 @@ so the difference is not attributable to kernels alone. The archived console
 records are under [`benchmarks/gfx908/history`](../../benchmarks/gfx908/history/README.md).
 
 At this commit, the omitted defaults were `-b 2048 -ub 512`, F16 K/V cache and
-automatic CPU thread count. A second retained run kept the source completely
+automatic CPU thread count. A second recorded run kept the source completely
 unchanged but used `-b 2048 -ub 1024`, Q8 K/V and 20 threads:
 
 | Quant | pp128 | pp512 | pp1024 | pp2048 |
@@ -76,16 +76,16 @@ but this row makes its contribution visible rather than attributing it to code.
 
 Early real-server MTP requests on the same upstream build reached 40.55 tok/s
 for Q6_K and 51.07 tok/s for IQ4_NL. These were individual service requests with
-different prompts and acceptance rates, not a matched no-spec/MTP oracle, and are
-therefore retained only as historical observations.
+different prompts and acceptance rates, so they are historical service
+observations rather than a controlled no-spec/MTP comparison.
 
 ## Short chronology
 
 The project moved through the following major turning points. Rows in the
-absolute-result column are retained measurements, but only arrows within one row
+absolute-result column are recorded measurements, but only arrows within one row
 are controlled comparisons. Rows that change ubatch are configuration gains.
 
-| Stage | Representative retained result | Interpretation |
+| Stage | Representative result | Interpretation |
 |---|---|---|
 | Upstream `e8e6c7af` | Q6/IQ4 pp2048: 714/712 tok/s | Historical default invocation |
 | Upstream, explicit ubatch 1024 | Q6/IQ4 pp2048: 850/857 tok/s | Same unmodified source; approximately +19-20% from the practical configuration |
@@ -102,7 +102,7 @@ This chronology is intentionally not summed. Controls overlap, several stages
 used different ubatches, and later attention/decode work affects different model
 shapes and context depths.
 
-## Retained incremental results
+## Incremental results
 
 ### Recurrent prefill
 
@@ -114,7 +114,7 @@ Chunked GDN, identical build with the route toggled and HIP graphs disabled:
 | Q4_K_M | +11.4% | +17.1% | +18.9% |
 
 The combined IQ4_NL prefill stack measured +27.3% at pp512, +22.2% at pp1024
-and +24.0% at pp2048 in its original matched oracle.
+and +24.0% at pp2048 in its original matched test.
 
 ### Flash attention
 
@@ -123,7 +123,7 @@ and +24.0% at pp2048 in its original matched oracle.
 | Native f32 VKQ MFMA accumulation | +4.8% on a real 27.9k-token prefill; width gate removed the decode regression |
 | Long-context 32x2 tile | +5.3% PP at 32k and +9.0% at 64k; neutral around 4-8k |
 | Quantized KQ subgroup | kernel +11.8% at 32k and +12.5% at 64k; approximately +2-4% no-spec whole-model TG |
-| Head-size 512 MFMA route | Gemma4 pp8192 +3.4%, pp32768 +22.7%, TG neutral in the qualifying oracle |
+| Head-size 512 MFMA route | Gemma4 pp8192 +3.4%, pp32768 +22.7%, TG neutral in the matched test |
 
 The quantized-FA deployment passed 681/681 covered cases. A 12-chunk PTB run
 was indistinguishable at `11.4265 ± 0.55086` versus
@@ -154,11 +154,20 @@ over as the daily profile's expected gain.
 These are useful real-world bounds but not clean A/B measurements:
 
 - Qwen3.6-27B Q6_K reached approximately 1.38k tok/s on a favorable initial
-  10k prefill with `-ub 4096`; larger retained contexts declined as expected.
+  10k prefill with `-ub 4096`; larger recorded contexts declined as expected.
 - Qwen3.6-27B IQ4_NL reached approximately 1.42k tok/s in the comparable
   service workload.
+- Gemma4-31B moved from 510.1 to 1035.9 tok/s at pp4096 when CDNA1 stopped
+  forcing large Q4_0 batches through MMQ. Wave64 dequantization later raised
+  pp4096 from 1037.7 to 1078.3 tok/s. The long-context FA route measured 1047.1
+  tok/s at pp8192 and 751.4 at pp32768; a real server request at roughly 20k
+  prompt tokens reached 757.4 tok/s.
 - Low-context MTP generation reached about 50-52 tok/s Q6_K and 58-61 tok/s
-  IQ4_NL; long-context attention and speculative acceptance reduce those rates.
+  IQ4_NL. Compared with the early upstream service observations of 40.55 and
+  51.07 tok/s, those ranges are roughly +23-28% and +14-19%. This is a useful
+  daily-use comparison, but not a controlled MTP-only A/B because prompts,
+  cache state and acceptance differed. Long-context attention and speculative
+  acceptance also reduce those rates.
 - Gemma4-31B Q4-based service decode reached about 45-46.5 tok/s at shallow
   context and about 37.5 tok/s after a roughly 20k-token prefill.
 - Offloaded GPT-OSS-120B reached roughly 36-40 tok/s depending on warm state and
@@ -169,5 +178,5 @@ These are useful real-world bounds but not clean A/B measurements:
 
 Raw profiler databases are too large and environment-specific for the main
 source branch. Compact CSV/JSON summaries, commands, hashes and analyzer scripts
-should be added under `benchmarks/gfx908/` as the oracle is rerun. Large raw
+should be added under `benchmarks/gfx908/` as the test matrix is rerun. Large raw
 captures may be attached to tagged releases or stored externally with hashes.

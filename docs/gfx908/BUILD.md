@@ -2,7 +2,7 @@
 
 ## Tested configuration
 
-The qualified build used Ubuntu in a Proxmox VM with the MI100 passed through,
+The daily-use build used Ubuntu in a Proxmox VM with the MI100 passed through,
 a custom ROCm development stack, and:
 
 ```sh
@@ -21,7 +21,7 @@ When ROCm is not installed in a system path, prepend its `bin` directory to
 `lib`, `lib64`, LLVM library directory, and the build's `bin` directory are in
 `LD_LIBRARY_PATH`.
 
-Verify the target in startup output. A qualified build should identify the AMD
+Verify the target in startup output. The build should identify the AMD
 device as CDNA1/gfx908 and report HIP flash attention and MMQ MFMA support.
 
 ## Optional recurrent prefill kernels
@@ -38,10 +38,10 @@ export GGML_HIP_GDN_CHUNK_GFX908_DIR=/absolute/path/to/gfx908-gdn-hsacos
 ```
 
 Without `GGML_HIP_GDN_CHUNK_GFX908=1`, the normal llama.cpp recurrence remains
-active. The route is guarded to the exact qualified Qwen GDN dimensions and
+active. The route is guarded to the exact tested Qwen GDN dimensions and
 falls back for other shapes.
 
-## Minimum validation before daily use
+## Checks before daily use
 
 1. Build without warnings promoted to errors.
 2. Run `test-backend-ops` for the complete HIP matmul and flash-attention sets.
@@ -52,7 +52,6 @@ falls back for other shapes.
 7. Deploy through a new build directory and retain the previous binary/config
    as the rollback target.
 
-The clean public history has been rebuilt successfully for the gfx908 target.
-It has not yet completed the hardware runtime and performance oracle on an
-MI100. The next MI100 session should perform that final reproducibility fence
-before replacing the existing daily build.
+The clean public history builds successfully for gfx908. It has not yet been
+rerun through the full correctness and performance matrix on the MI100. That
+rerun should happen before it replaces the existing daily build.

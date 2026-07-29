@@ -1,6 +1,6 @@
 # Historical gfx908 benchmark records
 
-These are the first retained `llama-bench` runs from the MI100 optimization
+These are the first recorded `llama-bench` runs from the MI100 optimization
 project. They establish the out-of-box upstream starting point before any local
 gfx908 changes.
 
@@ -40,13 +40,13 @@ Model size was 15.21 GiB with 27.32 billion parameters.
 
 These records preserve the historical default invocation. They are not the
 future canonical control because later production testing explicitly tuned
-batch and ubatch sizes. A fresh MI100 qualification should run both upstream and
+batch and ubatch sizes. A fresh MI100 test pass should run both upstream and
 the current branch with identical explicit settings and record each grouped
 commit as an optional intermediate checkpoint.
 
 ## Unmodified upstream with the first explicit configuration
 
-A later retained oracle still used the exact upstream commit, while setting
+A later recorded run still used the exact upstream commit, while setting
 `-b 2048 -ub 1024`, Q8 K/V cache and 20 CPU threads:
 
 | Quant | pp128 | pp512 | pp1024 | pp2048 |
