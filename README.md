@@ -1,5 +1,13 @@
 # llama.cpp
 
+> [!IMPORTANT]
+> This is an experimental `gfx908`/AMD Instinct MI100 optimization branch of
+> [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). It is maintained
+> as a reproducible daily-use build and engineering record, not as an official
+> llama.cpp or AMD distribution. Start with the
+> [gfx908 project guide](docs/gfx908/README.md) for supported hardware, build
+> instructions, qualification status, benchmark evidence, and rollback knobs.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
