@@ -45,6 +45,7 @@ prompt. Full commands and provenance belong in [BENCHMARKS.md](BENCHMARKS.md).
 | Change | Qualified result on MI100 |
 |---|---|
 | Chunked GDN, Qwen recurrent prefill | +12% at pp512 and about +19% at pp1024/2048 for Q6_K; similar transfer to Q4_K_M |
+| Runtime rocBLAS GEMM autotuner | IQ4_NL pp4096 1160.4 → 1445.9 tok/s with a warm cache in the same-build global-off/on control; replaces fragile hand-selected solution IDs with measured per-shape selection |
 | Combined Qwen IQ4_NL prefill stack | +22% to +27% at pp512-2048 in the original matched oracle |
 | CDNA1 long-context flash-attention tile | approximately +5% PP at 32k and +9% at 64k in the isolated Qwen oracle |
 | Native f32 FA accumulation | approximately +4.8% on a real 27.9k-token prefill; decode regression removed by width gating |
