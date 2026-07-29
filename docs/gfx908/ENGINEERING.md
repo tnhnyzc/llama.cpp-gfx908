@@ -18,23 +18,20 @@ Prompt processing and token generation required different work:
   did not describe the limit: request width, wave64 dependencies, occupancy,
   memory-level parallelism, launch overhead and serial latency all mattered.
 
-## Corrections that shaped the method
+## Measurement practice
 
-- A fast T256/I128 MMQ candidate failed complete output coverage. Its timings
-  were discarded, and exact multi-tile CPU-reference cases became mandatory.
-- High VGPR usage was initially discussed as spilling without scratch evidence.
-  Later work separated occupancy pressure from actual spills.
-- Whole-model MoE measurements were initially ranked by bytes in the GGUF,
-  overlooking CPU-offloaded experts. GPU-kernel conclusions now require direct
-  backend tests or verified tensor placement.
-- Several attractive whole-model gains exceeded the measured kernel-share
-  bound because controls came from different build lineages. Same-day controls,
-  binary hashes and reversed ordering are now required.
-- Profiler per-dispatch overhead materially inflated short-kernel durations.
-  Corrected kernel time is kept separate from wall time and launch/sync gaps.
+- Kernel timings are accepted only after complete output-coverage tests against
+  a CPU reference. This excludes fast but incomplete tile geometries.
+- VGPR pressure and register spilling are treated separately; spill claims
+  require compiler metadata or observed scratch traffic.
+- MoE results include verified GPU/CPU tensor placement rather than inferring
+  execution surface from bytes in the model file.
+- Whole-model gains are checked against kernel-share bounds and same-lineage
+  controls, with reversed run order where variance matters.
+- Profiler-adjusted kernel time is reported separately from wall time,
+  dispatch overhead and synchronization gaps.
 
-These corrections explain why the current branch includes focused regression
-tests and conservative guards.
+These rules are reflected in the regression tests and architecture guards.
 
 ## Current bottleneck map
 
@@ -77,7 +74,7 @@ tests and conservative guards.
 
 ## How results are labeled
 
-- **Qualified:** correctness, same-lineage A/B, reversed order where needed,
+- **Validated:** correctness, same-lineage A/B, reversed order where needed,
   and whole-model validation completed.
 - **Staged:** direct-kernel correctness/performance is established but production
   breadth or quality validation is incomplete.

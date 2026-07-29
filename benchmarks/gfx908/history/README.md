@@ -38,15 +38,13 @@ Model size was 15.21 GiB with 27.32 billion parameters.
 
 ## Interpretation
 
-These records preserve the historical default invocation. They are not the
-future canonical control because later production testing explicitly tuned
-batch and ubatch sizes. A fresh MI100 test pass should run both upstream and
-the current branch with identical explicit settings and record each grouped
-commit as an optional intermediate checkpoint.
+These records preserve the default invocation. The canonical comparison should
+run upstream and the current branch with identical explicit batch and ubatch
+settings, with grouped commits available as optional intermediate points.
 
 ## Unmodified upstream with the first explicit configuration
 
-A later recorded run still used the exact upstream commit, while setting
+The explicit-configuration run uses the same upstream commit with
 `-b 2048 -ub 1024`, Q8 K/V cache and 20 CPU threads:
 
 | Quant | pp128 | pp512 | pp1024 | pp2048 |

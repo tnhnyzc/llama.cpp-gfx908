@@ -18,26 +18,21 @@ Perplexity comparisons must use the same corpus, tokenization, chunk count,
 batch width and command line. Server figures are kept separate from
 `llama-bench` and direct-kernel measurements.
 
-## What the historical numbers mean
+## Baseline and comparison scope
 
-There are two useful but different views of the project:
+The repository records two complementary views of performance:
 
-1. The first recorded upstream run shows the out-of-box experience before any
-   gfx908 work. It used `llama-bench` defaults and is the honest historical
-   starting point.
-2. Later optimization work used larger explicit batch and ubatch settings. Those
-   runs isolate real improvements, but they cannot be arranged into a single
-   code-only speedup by comparing their absolute values with the default run.
+1. An upstream baseline using the default `llama-bench` batch settings.
+2. Matched A/B tests using explicit batch and ubatch settings for individual
+   configuration and code changes.
 
-The final clean branch has been rebuilt for gfx908 but has not yet been rerun on
-MI100 with identical settings. Until that run exists, this page does not invent
-a single "upstream to current" percentage from unlike tests.
+The clean branch builds for gfx908. A same-settings MI100 run against current
+upstream is still pending, so no single code-only percentage is derived from
+tests with different settings.
 
-The practical endpoint is nevertheless meaningful: favorable 27B prefill moved
-from roughly 712-714 tok/s in the first stock run to roughly 1.3-1.5k tok/s over
-the course of the project. That is the real user-visible progression, with both
-configuration and code improvements included. A future normalized row will
-separate their contributions without replacing this historical record.
+The practical end-to-end comparison remains useful: favorable 27B prefill is
+roughly 1.3-1.5k tok/s, compared with 712-714 tok/s in the upstream default run.
+This includes both configuration and code improvements.
 
 ## Original upstream baseline
 
@@ -54,10 +49,9 @@ llama-bench -p 128,512,2048,8192 -n 128 -r 5 -ngl 999 -fa auto
 | Q6_K | 383.98 ± 46.71 | 709.51 ± 30.69 | 714.00 ± 1.33 | 683.60 ± 2.53 | 26.70 ± 0.54 |
 | IQ4_NL | 617.80 ± 86.61 | 708.53 ± 31.85 | 712.30 ± 1.51 | 682.05 ± 2.84 | 36.65 ± 0.09 |
 
-These unexpectedly low PP values are real for that invocation. Later figures
-above 1,000 tok/s combine code improvements with deliberate batch/ubatch tuning,
-so the difference is not attributable to kernels alone. The archived console
-records are under [`benchmarks/gfx908/history`](../../benchmarks/gfx908/history/README.md).
+These results use the default `-ub 512`. Results above 1,000 tok/s use tuned
+batch settings as well as code changes. Archived console records are under
+[`benchmarks/gfx908/history`](../../benchmarks/gfx908/history/README.md).
 
 At this commit, the omitted defaults were `-b 2048 -ub 512`, F16 K/V cache and
 automatic CPU thread count. A second recorded run kept the source completely
@@ -74,12 +68,12 @@ has little effect on zero-depth bulk prefill, and CPU thread count is secondary
 once the work is on GPU. Configuration tuning is part of the practical project,
 but this row makes its contribution visible rather than attributing it to code.
 
-Early real-server MTP requests on the same upstream build reached 40.55 tok/s
-for Q6_K and 51.07 tok/s for IQ4_NL. These were individual service requests with
-different prompts and acceptance rates, so they are historical service
-observations rather than a controlled no-spec/MTP comparison.
+The upstream service baselines for low-context MTP were 40.55 tok/s for Q6_K
+and 51.07 tok/s for IQ4_NL. They use different prompts and acceptance rates from
+the current service figures and are therefore practical rather than controlled
+comparisons.
 
-## Short chronology
+## Configuration and optimization progression
 
 The project moved through the following major turning points. Rows in the
 absolute-result column are recorded measurements, but only arrows within one row
@@ -92,15 +86,15 @@ are controlled comparisons. Rows that change ubatch are configuration gains.
 | Chunked recurrent prefill | Q6 +12.1% pp512, +19.3% pp2048 | Removed the dominant recurrent-prefill bottleneck |
 | Larger ubatch | IQ4 pp4096: 1027.5 → 1105.7 | +7.6% from ubatch 1024 → 2048 |
 | Exact rocBLAS solution selection | IQ4: 1112.45 → 1346.21; Q6: 1108.05 → 1345.42 | About +21% at pp4096, TG neutral |
-| Runtime GEMM autotuning | IQ4 pp4096: 1160.4 → 1445.9 | Same later build, autotuning globally off versus warm cache; overlaps the preceding row |
+| Runtime GEMM autotuning | IQ4 pp4096: 1160.4 → 1445.9 | Same build, autotuning globally off versus warm cache; overlaps the preceding row |
 | Tiled recurrent concat | Q6 pp4096: 1400.26 → 1440.22 | +2.9% isolated data-layout improvement |
 | ubatch 4096 | IQ4: 1444.80 → 1518.17; Q6: 1435.94 → 1531.11 | Additional PP at a material VRAM cost |
-| Later attention/decode work | See the isolated tables below | Mostly long-context PP/TG and quant-specific gains |
-| Current clean branch | Runtime result pending | Source reconstructed and compiled; MI100 rerun still required |
+| Attention/decode work | See the isolated tables below | Mostly long-context PP/TG and quant-specific gains |
+| Current branch | Same-settings comparison pending | Builds successfully for gfx908; MI100 comparison still required |
 
-This chronology is intentionally not summed. Controls overlap, several stages
-used different ubatches, and later attention/decode work affects different model
-shapes and context depths.
+These rows should not be summed: some controls overlap, several stages use
+different ubatches, and attention/decode changes apply to different model shapes
+and context depths.
 
 ## Incremental results
 
@@ -114,7 +108,7 @@ Chunked GDN, identical build with the route toggled and HIP graphs disabled:
 | Q4_K_M | +11.4% | +17.1% | +18.9% |
 
 The combined IQ4_NL prefill stack measured +27.3% at pp512, +22.2% at pp1024
-and +24.0% at pp2048 in its original matched test.
+and +24.0% at pp2048 in matched tests.
 
 ### Flash attention
 
@@ -139,7 +133,7 @@ Q4_K/Q5_K branchless metadata reconstruction:
 | Q5_K 5120 x 6144 direct kernel | 37.08 us | 33.32 us | +11.3% |
 | Qwen Q4_K_M whole-model TG mean | 31.695 t/s | 35.05 t/s | +10.59% |
 
-Qualification covered 22/22 Q5_K cases, 43/43 Q4_K cases, and 1164/1164
+Correctness testing covered 22/22 Q5_K cases, 43/43 Q4_K cases, and 1164/1164
 ROCm `MUL_MAT` cases. The four-chunk Q4_K_M perplexity result was
 `14.3074 ± 1.21672` for control and `14.3131 ± 1.21708` for candidate.
 
@@ -157,13 +151,12 @@ These are useful real-world bounds but not clean A/B measurements:
   10k prefill with `-ub 4096`; larger recorded contexts declined as expected.
 - Qwen3.6-27B IQ4_NL reached approximately 1.42k tok/s in the comparable
   service workload.
-- Gemma4-31B moved from 510.1 to 1035.9 tok/s at pp4096 when CDNA1 stopped
-  forcing large Q4_0 batches through MMQ. Wave64 dequantization later raised
-  pp4096 from 1037.7 to 1078.3 tok/s. The long-context FA route measured 1047.1
-  tok/s at pp8192 and 751.4 at pp32768; a real server request at roughly 20k
-  prompt tokens reached 757.4 tok/s.
+- Gemma4-31B measured 1078.3 tok/s at pp4096, 1047.1 at pp8192 and 751.4 at
+  pp32768. Its pp4096 baseline was 510.1 tok/s before CDNA1 batch routing and
+  wave64 dequantization. A real server request at roughly 20k prompt tokens
+  reached 757.4 tok/s.
 - Low-context MTP generation reached about 50-52 tok/s Q6_K and 58-61 tok/s
-  IQ4_NL. Compared with the early upstream service observations of 40.55 and
+  IQ4_NL. Compared with the upstream service baselines of 40.55 and
   51.07 tok/s, those ranges are roughly +23-28% and +14-19%. This is a useful
   daily-use comparison, but not a controlled MTP-only A/B because prompts,
   cache state and acceptance differed. Long-context attention and speculative

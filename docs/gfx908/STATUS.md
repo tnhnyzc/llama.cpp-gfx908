@@ -47,8 +47,7 @@ experimental.
 - A standalone fused IQ4_NL FP16-MFMA feasibility kernel substantially reduced
   decode overhead but did not yet beat the selected Tensile schedule. It is not
   the same as a complete production fused kernel.
-- Several invalid or incomplete MMQ geometries produced attractive numbers
-  before failing full output-coverage tests. They are intentionally absent.
+- Incomplete MMQ geometries are excluded by full output-coverage tests.
 - Q4_0 wider-load experiments did not reproduce the IQ4_NL gain in the full
   model and are absent.
 - Q6_K metadata deletion bounded that path at about 0.61% of its tested kernel;
@@ -65,5 +64,5 @@ experimental.
   is not currently available.
 - Rebase onto current upstream and repeat the full test matrix before changing
   the production branch.
-- Re-check generic paths touched by the old production tree and add explicit
+- Review generic paths carried by the production tree and add explicit
   CDNA1 guards wherever the optimization is not intended for CUDA/RDNA.
