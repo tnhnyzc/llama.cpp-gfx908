@@ -443,6 +443,19 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
+#if defined(CDNA1)
+template<int dpp_ctrl>
+static __device__ __forceinline__ float ggml_hip_move_dpp_f32(float x) {
+    union {
+        float f;
+        int   i;
+    } value;
+    value.f = x;
+    value.i = __builtin_amdgcn_mov_dpp(value.i, dpp_ctrl, 0xf, 0xf, true);
+    return value.f;
+}
+#endif
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
@@ -450,6 +463,71 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ float warp_reduce_sum_dpp(float x) {
+#if defined(CDNA1)
+    if constexpr (width == 64) {
+        // Keep the reduction in the VALU/DPP path. The generic HIP shuffle
+        // loop lowers each stage to ds_bpermute_b32 plus a dependent
+        // s_waitcnt. gfx908 can reduce each 16-lane row with DPP, combine
+        // rows with the CDNA1 row-broadcast controls, then broadcast the
+        // completed value once.
+        x += ggml_hip_move_dpp_f32<0x0b1>(x); // quad_perm:[1,0,3,2]
+        x += ggml_hip_move_dpp_f32<0x04e>(x); // quad_perm:[2,3,0,1]
+        x += ggml_hip_move_dpp_f32<0x124>(x); // row_ror:4
+        x += ggml_hip_move_dpp_f32<0x128>(x); // row_ror:8
+        x += ggml_hip_move_dpp_f32<0x142>(x); // row_bcast:15
+        x += ggml_hip_move_dpp_f32<0x143>(x); // row_bcast:31
+        return __shfl_sync(0xffffffff, x, 63, 64);
+    }
+#endif
+    return warp_reduce_sum<width>(x);
+}
+
+template<int n, int width = WARP_SIZE>
+static __device__ __forceinline__ void warp_reduce_sum_n(float * x) {
+#if defined(CDNA1)
+    if constexpr (width == 64) {
+        // Interleave independent accumulators at each DPP stage. Reducing
+        // them one at a time makes clang serialize six dependent DPP chains
+        // for MMVQ N=3 and insert latency-padding NOPs between every stage.
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x0b1>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x04e>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x124>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x128>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x142>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x143>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] = __shfl_sync(0xffffffff, x[i], 63, 64);
+        }
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        x[i] = warp_reduce_sum<width>(x[i]);
+    }
 }
 
 template<int width = WARP_SIZE>

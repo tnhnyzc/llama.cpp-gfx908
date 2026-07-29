@@ -504,7 +504,8 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-    const uint8_t * __restrict__ m, const half2 & dm4, const float * __restrict__ d8) {
+    const uint8_t * __restrict__ m, const half2 & dm4, const half2 * __restrict__ ds8,
+    const bool min_lane) {
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -515,10 +516,10 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
 
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
-        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
+        const float2 ds8f = __half22float2(ds8[i]);
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+        sumf_d += ds8f.x * (dot1 * sc[i]);
+        sumf_m += min_lane ? ds8f.y * m[i] : 0.0f;
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -560,7 +561,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 // contiguous v/x values
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
     const int * __restrict__ vl, const int * __restrict__ vh, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-    const uint8_t * __restrict__ m, const half2 & dm5, const float * __restrict__ d8) {
+    const uint8_t * __restrict__ m, const half2 & dm5, const half2 * __restrict__ ds8,
+    const bool min_lane) {
 
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
@@ -577,10 +579,10 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int v1i = vl1i | vh1i;
 
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
-        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+        const float2 ds8f = __half22float2(ds8[i]);
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += ds8f.x * (dot1 * sc[i]);
+        sumf_m += min_lane ? ds8f.y * m[i] : 0.0f;
 
     }
 
@@ -873,7 +875,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     int    v[2];
     int    u[2*QR4_K];
-    float d8[QR4_K];
+    half2 ds8[QR4_K];
 
     // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
@@ -890,6 +892,20 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(CDNA1)
+    // Avoid executing both packed scale/min extraction paths across wave64.
+    const uint32_t * scales32 = (const uint32_t *)bq4_K->scales;
+    const uint32_t scales_lo = scales32[0] & 0x3f3f3f3f;
+    const uint32_t mins_lo   = scales32[1] & 0x3f3f3f3f;
+    const uint32_t scales_hi = (scales32[2] & 0x0f0f0f0f) | ((scales32[0] >> 2) & 0x30303030);
+    const uint32_t mins_hi   = ((scales32[2] >> 4) & 0x0f0f0f0f) | ((scales32[1] >> 2) & 0x30303030);
+    const uint32_t hi_mask   = 0U - uint32_t(j >> 1);
+    const uint32_t shift     = 16U * uint32_t(j & 1);
+    const uint32_t scales_j  = (scales_lo ^ ((scales_lo ^ scales_hi) & hi_mask)) >> shift;
+    const uint32_t mins_j    = (mins_lo   ^ ((mins_lo   ^ mins_hi)   & hi_mask)) >> shift;
+    aux[0] = uint16_t(scales_j);
+    aux[1] = uint16_t(mins_j);
+#else
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -897,19 +913,85 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
+        ds8[i] = bq8i->ds;
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, ds8, ((iqs/2)%4) == 0);
+}
+
+// Compute the two M=2 columns while the packed Q4_K block and its scale
+// metadata are live. This avoids decoding/loading the same weight block once
+// per destination column. The q8 inputs remain separate.
+static __device__ __forceinline__ void vec_dot_q4_K_q8_1_m2(
+    const void * __restrict__ vbq,
+    const block_q8_1 * __restrict__ bq8_1_0,
+    const block_q8_1 * __restrict__ bq8_1_1,
+    const int & kbx, const int & iqs, float & result_0, float & result_1) {
+
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    uint16_t aux[2];
+    const int j = bq8_offset/2;
+    if (j < 2) {
+        aux[0] = scales[j+0] & 0x3f3f;
+        aux[1] = scales[j+2] & 0x3f3f;
+    } else {
+        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+    }
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+    float sumf_d_0 = 0.0f;
+    float sumf_m_0 = 0.0f;
+    float sumf_d_1 = 0.0f;
+    float sumf_m_1 = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int v0i = (v0 >> (4*i)) & 0x0F0F0F0F;
+        const int v1i = (v1 >> (4*i)) & 0x0F0F0F0F;
+
+        const block_q8_1 * bq8i_0 = bq8_1_0 + bq8_offset + i;
+        const block_q8_1 * bq8i_1 = bq8_1_1 + bq8_offset + i;
+        const int * q8_0 = (const int *) bq8i_0->qs + ((iqs/2)%4);
+        const int * q8_1 = (const int *) bq8i_1->qs + ((iqs/2)%4);
+
+        const int u00 = q8_0[0];
+        const int u01 = q8_0[4];
+        const int u10 = q8_1[0];
+        const int u11 = q8_1[4];
+
+        const int dot_d_0 = ggml_cuda_dp4a(v1i, u01, ggml_cuda_dp4a(v0i, u00, 0));
+        const int dot_d_1 = ggml_cuda_dp4a(v1i, u11, ggml_cuda_dp4a(v0i, u10, 0));
+
+        const float2 ds8_0 = __half22float2(bq8i_0->ds);
+        const float2 ds8_1 = __half22float2(bq8i_1->ds);
+        sumf_d_0 += ds8_0.x * (dot_d_0 * sc[i]);
+        sumf_m_0 += ((iqs/2)%4) == 0 ? ds8_0.y * m[i] : 0.0f;
+        sumf_d_1 += ds8_1.x * (dot_d_1 * sc[i]);
+        sumf_m_1 += ((iqs/2)%4) == 0 ? ds8_1.y * m[i] : 0.0f;
+    }
+
+    const float2 dm4f = __half22float2(bq4_K->dm);
+    result_0 = dm4f.x*sumf_d_0 - dm4f.y*sumf_m_0;
+    result_1 = dm4f.x*sumf_d_1 - dm4f.y*sumf_m_1;
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
@@ -920,7 +1002,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     int   vl[2];
     int   vh[2];
     int    u[2*QR5_K];
-    float d8[QR5_K];
+    half2 ds8[QR5_K];
 
     const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
     const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
@@ -935,6 +1017,23 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(CDNA1)
+    // Q5_K packs four low scale/min bytes followed by four bytes containing
+    // the high scale/min values and their two upper bits. Decode both halves
+    // without a lane-divergent branch: on wave64, the j < 2 and j >= 2 lane
+    // groups otherwise make the wave execute both dependent extraction paths.
+    const uint32_t * scales32 = (const uint32_t *)bq5_K->scales;
+    const uint32_t scales_lo = scales32[0] & 0x3f3f3f3f;
+    const uint32_t mins_lo   = scales32[1] & 0x3f3f3f3f;
+    const uint32_t scales_hi = (scales32[2] & 0x0f0f0f0f) | ((scales32[0] >> 2) & 0x30303030);
+    const uint32_t mins_hi   = ((scales32[2] >> 4) & 0x0f0f0f0f) | ((scales32[1] >> 2) & 0x30303030);
+    const uint32_t hi_mask   = 0U - uint32_t(j >> 1);
+    const uint32_t shift     = 16U * uint32_t(j & 1);
+    const uint32_t scales_j  = (scales_lo ^ ((scales_lo ^ scales_hi) & hi_mask)) >> shift;
+    const uint32_t mins_j    = (mins_lo   ^ ((mins_lo   ^ mins_hi)   & hi_mask)) >> shift;
+    aux[0] = uint16_t(scales_j);
+    aux[1] = uint16_t(mins_j);
+#else
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -942,20 +1041,21 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
 #pragma unroll
     for (int i = 0; i < QR5_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = __low2float(bq8i->ds);
+        ds8[i] = bq8i->ds;
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
         u[2*i+1] = q8[4];
     }
 
-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, ds8, ((iqs/2)%4) == 0);
 }
 
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
@@ -982,6 +1082,45 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+}
+
+static __device__ __forceinline__ void vec_dot_q6_K_q8_1_m2(
+    const void * __restrict__ vbq,
+    const block_q8_1 * __restrict__ bq8_1_0,
+    const block_q8_1 * __restrict__ bq8_1_1,
+    const int & kbx, const int & iqs, float & result_0, float & result_1) {
+
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    float sumf_0 = 0.0f;
+    float sumf_1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+        const int vi = __vsubss4((vil | vih), 0x20202020);
+
+        const block_q8_1 * bq8i_0 = bq8_1_0 + bq8_offset + 2*i;
+        const block_q8_1 * bq8i_1 = bq8_1_1 + bq8_offset + 2*i;
+        const int u_0 = get_int_b4(bq8i_0->qs, iqs % QI8_1);
+        const int u_1 = get_int_b4(bq8i_1->qs, iqs % QI8_1);
+        const int sc = scales[4*i];
+
+        sumf_0 += __low2float(bq8i_0->ds) * (ggml_cuda_dp4a(vi, u_0, 0) * sc);
+        sumf_1 += __low2float(bq8i_1->ds) * (ggml_cuda_dp4a(vi, u_1, 0) * sc);
+    }
+
+    const float d = bq6_K->d;
+    result_0 = d * sumf_0;
+    result_1 = d * sumf_1;
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
@@ -1269,7 +1408,11 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
 
-#define VDR_IQ4_NL_Q8_1_MMVQ 2
+// One gfx908 thread consumes the whole 16-byte IQ4_NL block. This changes the
+// N=1 MMVQ load from two 8-byte pieces to one 16-byte transaction per thread.
+// Keep the change scoped to IQ4_NL; other quant layouts need independent
+// geometry qualification.
+#define VDR_IQ4_NL_Q8_1_MMVQ 4
 #define VDR_IQ4_NL_Q8_1_MMQ  4
 
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
@@ -1281,7 +1424,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 
     int sumi = 0;
 #pragma unroll
-    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
@@ -1291,6 +1434,34 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 
     const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
     return d * sumi;
+}
+
+static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_m2(
+    const void * __restrict__ vbq,
+    const block_q8_1 * __restrict__ bq8_1_0,
+    const block_q8_1 * __restrict__ bq8_1_1,
+    const int & kbx, const int & iqs, float & result_0, float & result_1) {
+
+    const block_iq4_nl * bq4 = (const block_iq4_nl *) vbq + kbx;
+    const int * q8_0 = (const int *) bq8_1_0->qs + iqs;
+    const int * q8_1 = (const int *) bq8_1_1->qs + iqs;
+
+    int sumi_0 = 0;
+    int sumi_1 = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+
+        sumi_0 = ggml_cuda_dp4a(v.x, q8_0[l + 0], sumi_0);
+        sumi_0 = ggml_cuda_dp4a(v.y, q8_0[l + 4], sumi_0);
+        sumi_1 = ggml_cuda_dp4a(v.x, q8_1[l + 0], sumi_1);
+        sumi_1 = ggml_cuda_dp4a(v.y, q8_1[l + 4], sumi_1);
+    }
+
+    const float d = __half2float(bq4->d);
+    result_0 = d * __low2float(bq8_1_0->ds) * sumi_0;
+    result_1 = d * __low2float(bq8_1_1->ds) * sumi_1;
 }
 
 #define VDR_IQ4_XS_Q8_1_MMVQ 4
