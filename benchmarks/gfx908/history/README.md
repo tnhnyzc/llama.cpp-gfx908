@@ -43,3 +43,17 @@ future canonical control because later production testing explicitly tuned
 batch and ubatch sizes. A fresh MI100 qualification should run both upstream and
 the current branch with identical explicit settings and record each grouped
 commit as an optional intermediate checkpoint.
+
+## Unmodified upstream with the first explicit configuration
+
+A later retained oracle still used the exact upstream commit, while setting
+`-b 2048 -ub 1024`, Q8 K/V cache and 20 CPU threads:
+
+| Quant | pp128 | pp512 | pp1024 | pp2048 |
+|---|---:|---:|---:|---:|
+| Q6_K | 380.02 | 686.14 | 858.44 | 850.16 |
+| IQ4_NL | 603.88 | 702.53 | 867.78 | 856.98 |
+
+This is the bridge between the out-of-box run and the code-optimization work.
+At pp2048 it is approximately 19-20% faster than the default-ubatch run without
+changing llama.cpp source.

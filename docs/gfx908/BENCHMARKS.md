@@ -53,6 +53,21 @@ above 1,000 tok/s combine code improvements with deliberate batch/ubatch tuning,
 so the difference is not attributable to kernels alone. The archived console
 records are under [`benchmarks/gfx908/history`](../../benchmarks/gfx908/history/README.md).
 
+At this commit, the omitted defaults were `-b 2048 -ub 512`, F16 K/V cache and
+automatic CPU thread count. A second retained run kept the source completely
+unchanged but used `-b 2048 -ub 1024`, Q8 K/V and 20 threads:
+
+| Quant | pp128 | pp512 | pp1024 | pp2048 |
+|---|---:|---:|---:|---:|
+| Q6_K | 380.02 | 686.14 | 858.44 | 850.16 |
+| IQ4_NL | 603.88 | 702.53 | 867.78 | 856.98 |
+
+That is approximately +19% Q6_K and +20% IQ4_NL at pp2048 over the original
+default invocation. Ubatches account for most of the difference; K/V precision
+has little effect on zero-depth bulk prefill, and CPU thread count is secondary
+once the work is on GPU. Configuration tuning is part of the practical project,
+but this row makes its contribution visible rather than attributing it to code.
+
 Early real-server MTP requests on the same upstream build reached 40.55 tok/s
 for Q6_K and 51.07 tok/s for IQ4_NL. These were individual service requests with
 different prompts and acceptance rates, not a matched no-spec/MTP oracle, and are
@@ -67,6 +82,7 @@ are controlled comparisons. Rows that change ubatch are configuration gains.
 | Stage | Representative retained result | Interpretation |
 |---|---|---|
 | Upstream `e8e6c7af` | Q6/IQ4 pp2048: 714/712 tok/s | Historical default invocation |
+| Upstream, explicit ubatch 1024 | Q6/IQ4 pp2048: 850/857 tok/s | Same unmodified source; approximately +19-20% from the practical configuration |
 | Chunked recurrent prefill | Q6 +12.1% pp512, +19.3% pp2048 | Removed the dominant recurrent-prefill bottleneck |
 | Larger ubatch | IQ4 pp4096: 1027.5 → 1105.7 | +7.6% from ubatch 1024 → 2048 |
 | Exact rocBLAS solution selection | IQ4: 1112.45 → 1346.21; Q6: 1108.05 → 1345.42 | About +21% at pp4096, TG neutral |
