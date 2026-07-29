@@ -59,6 +59,32 @@ tok/s prefill at favorable Qwen3.6-27B prompt shapes with `-ub 4096`, around
 Those service figures combine workload, cache and speculative-decoding effects;
 they are retained as deployment observations rather than clean incremental A/Bs.
 
+In practical terms, favorable Qwen prefill roughly doubled from the first stock
+experience. Shallow non-speculative TG moved much less. The more transferable TG
+gain appears at long context, where attention becomes a larger part of each
+token: the quantized KQ subdivision reduced the attention kernel by 11.8-12.5%
+at 32-64k and translated to approximately +2-4% whole-model no-spec TG. This is
+separate from MTP acceptance and therefore applies to models without speculation.
+
+## Model-level anchors
+
+These server measurements make the scope easier to interpret. They combine all
+applicable backend and deployment changes rather than attributing the result to
+one kernel.
+
+| Model | Earlier state | Improved state | Practical reading |
+|---|---|---|---|
+| Qwen3.6-27B Q6_K | stock PP around 714 tok/s with default ubatch; shallow no-spec TG around 27 tok/s | favorable service PP around 1.3-1.4k; low-context MTP around 50-52 tok/s | PP changed dramatically; shallow base TG improved much less |
+| Qwen3.6-27B IQ4_NL | stock PP around 712 tok/s; shallow no-spec TG around 36.7 tok/s | favorable service PP around 1.4k; low-context MTP around 58-61 tok/s | fastest resident 27B profile; TG remains context- and acceptance-sensitive |
+| Gemma4-31B, Q4_0-based | 459.7 PP / 45.55 TG in the matched old-server run | 738.2 PP / 45.68 TG after CDNA1 routing and autotuning | +60.6% server PP with neutral shallow TG; later real use reached about 45-46.5 TG shallow and 37.5 after a ~20k prefill |
+| GPT-OSS-120B, CPU-offloaded MXFP4 MoE | 23.2 TG on plain mainline | about 35.7 TG in the matched migration; typically 36-38 warm | +54% measured TG, but CPU placement and contention remain part of the result |
+| Step-3.7-Flash, heavily offloaded | 14.7 TG | 16.9 TG in the matched migration; typically 17-18 warm | about +15%; storage and CPU traffic cap the GPU-side benefit |
+
+The first two rows intentionally mix the historical default invocation with
+later practical service observations. They describe the user-visible journey,
+not a code-only controlled ratio. The next MI100 qualification will add a
+same-settings upstream-versus-current row for Q6_K and IQ4_NL.
+
 ## Start here
 
 - [BUILD.md](BUILD.md) — build and runtime setup

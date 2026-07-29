@@ -33,6 +33,12 @@ The final clean branch has been rebuilt for gfx908 but has not yet been rerun on
 MI100. Until that same-oracle rerun exists, this page deliberately does not show
 a synthetic "upstream to current" percentage.
 
+The practical endpoint is nevertheless meaningful: favorable 27B prefill moved
+from roughly 712-714 tok/s in the first stock run to roughly 1.3-1.5k tok/s over
+the course of the project. That is the real user-visible progression, with both
+configuration and code improvements included. A future normalized row will
+separate their contributions without replacing this historical record.
+
 ## Original upstream baseline
 
 The retained raw runs use upstream commit
