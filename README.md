@@ -4,7 +4,8 @@
 > This is a `gfx908`/AMD Instinct MI100 optimization branch of
 > [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). It is maintained
 > as a reproducible daily-use build with benchmarks and engineering notes. It
-> is independent of llama.cpp and AMD. Start with the
+> is independently maintained and is not an official AMD or llama.cpp project.
+> Start with the
 > [gfx908 project guide](docs/gfx908/README.md) for supported hardware, build
 > instructions, results, current status, and rollback options.
 
