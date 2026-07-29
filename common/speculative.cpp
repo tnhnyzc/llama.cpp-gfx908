@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1390,36 +1391,56 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // With a single Qwen MTP head and one drafted token, draft() has
+            // already evaluated batch_in[0]. The server can retain that state,
+            // leaving only batch_in[1] to be caught up here.
+            const bool reuse_draft_prefix =
+                std::getenv("GGML_MTP_REUSE_DRAFT_PREFIX") != nullptr &&
+                params.n_max == 1 &&
+                n_mtp_layers == 1 &&
+                !chain_heads &&
+                n_seq == 1 &&
+                n_tokens == 2 &&
+                i_batch_beg[0] == 0 &&
+                i_batch_end[0] == 1 &&
+                llama_memory_seq_pos_max(mem_dft, 0) == batch_in.pos[0];
+
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+            if (reuse_draft_prefix) {
+                common_batch_add(batch, batch_in.token[1], batch_in.pos[1], { batch_in.seq_id[1][0] }, 0);
+                const float * h_tgt = llama_get_embeddings_nextn_ith(ctx_tgt, 0);
+                std::memcpy(batch.embd, h_tgt, row_bytes);
+            } else {
+                for (int k = 0; k < n_tokens; ++k) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
-            }
+                // shift the tgt embeddings to the right by one position
+                // assumes that the tokens in the batch are sequential for each sequence
+                // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+                //                                                       ^--- this is a problem
+                // TODO:this is generally true, but would be nice to assert it
+                {
+                    const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                }
 
-            auto * mem_dft = llama_get_memory(ctx_dft);
+                // fill the pending embeddings from a previous run
+                auto set_h = [&](int idx, const float * h_row) {
+                    std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                };
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                }
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers; ++head) {
