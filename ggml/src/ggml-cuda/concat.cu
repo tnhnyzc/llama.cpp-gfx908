@@ -139,6 +139,113 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim-0 concat where src1 is a transposed view of a contiguous tensor.
+//
+// This is the shape the delta-net conv-state builder produces: qkv_mixed is
+// transposed and then concatenated onto the previous conv states, so the generic
+// non-contiguous kernel reads src1 with consecutive threads striding by a full
+// row (40 KiB for Qwen3.6-27B). Measured ~98 GB/s, i.e. 8% of peak, and 4-6% of
+// total prefill time.
+//
+// Reads are coalesced along src1's contiguous axis into LDS, then written out
+// coalesced along dst's contiguous axis -- an ordinary tiled transpose.
+#define CUDA_CONCAT_T_TILE 32
+
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_T_TILE * 8)
+concat_dim0_transpose_src1(const char * __restrict__ src1,
+                                 char * __restrict__ dst,
+                                 int64_t ne00, int64_t ne1, int64_t n1t,
+                                 uint64_t nb10, uint64_t nb11,
+                                 uint64_t nb0,  uint64_t nb1) {
+    __shared__ T tile[CUDA_CONCAT_T_TILE][CUDA_CONCAT_T_TILE + 1];
+
+    const int64_t c_base = (int64_t) blockIdx.x * CUDA_CONCAT_T_TILE;   // along ne1 (src1 contiguous)
+    const int64_t t_base = (int64_t) blockIdx.y * CUDA_CONCAT_T_TILE;   // along src1's strided axis
+
+    for (int j = threadIdx.y; j < CUDA_CONCAT_T_TILE; j += blockDim.y) {
+        const int64_t t = t_base + j;
+        const int64_t c = c_base + threadIdx.x;
+        if (t < n1t && c < ne1) {
+            tile[j][threadIdx.x] = *(const T *)(src1 + t*nb10 + c*nb11);
+        }
+    }
+    __syncthreads();
+
+    for (int j = threadIdx.y; j < CUDA_CONCAT_T_TILE; j += blockDim.y) {
+        const int64_t c = c_base + j;                       // ne1 index
+        const int64_t t = t_base + threadIdx.x;             // src1 strided index
+        if (t < n1t && c < ne1) {
+            *(T *)(dst + c*nb1 + (t + ne00)*nb0) = tile[threadIdx.x][j];
+        }
+    }
+}
+
+// The src0 part is only ne00 columns wide (3 for a conv kernel of 4), so a plain
+// kernel is fine.
+template <typename T>
+static __global__ void concat_dim0_copy_src0(const char * __restrict__ src0,
+                                                   char * __restrict__ dst,
+                                                   int64_t ne00, int64_t ne1,
+                                                   uint64_t nb00, uint64_t nb01,
+                                                   uint64_t nb0,  uint64_t nb1) {
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ne1) {
+        return;
+    }
+    for (int64_t i0 = 0; i0 < ne00; ++i0) {
+        *(T *)(dst + c*nb1 + i0*nb0) = *(const T *)(src0 + c*nb01 + i0*nb00);
+    }
+}
+
+// Only takes the fast path for the exact situation described above: 2D, dim 0,
+// src1 unit-strided along dst's ne1 axis, src0 and dst well-formed.
+template <typename T>
+static bool concat_try_dim0_transpose(const ggml_tensor * src0, const ggml_tensor * src1,
+                                      ggml_tensor * dst, int dim, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_CONCAT_TRANSPOSE_GFX908");
+        return env == nullptr || (env[0] == '1' && env[1] == '\0');
+    }();
+    if (!enabled || dim != 0) {
+        return false;
+    }
+    if (dst->ne[2] != 1 || dst->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (src1->nb[1] != sizeof(T) || src1->nb[0] <= sizeof(T)) {
+        return false;
+    }
+    if (src1->ne[1] != dst->ne[1] || src0->ne[1] != dst->ne[1]) {
+        return false;
+    }
+    if (dst->nb[0] != sizeof(T) || src0->nb[0] != sizeof(T)) {
+        return false;
+    }
+    if (src0->ne[0] + src1->ne[0] != dst->ne[0]) {
+        return false;
+    }
+
+    const int64_t ne1 = dst->ne[1];
+    const int64_t n1t = src1->ne[0];
+
+    const dim3 tblocks((ne1 + CUDA_CONCAT_T_TILE - 1) / CUDA_CONCAT_T_TILE,
+                       (n1t + CUDA_CONCAT_T_TILE - 1) / CUDA_CONCAT_T_TILE, 1);
+    concat_dim0_transpose_src1<T><<<tblocks, dim3(CUDA_CONCAT_T_TILE, 8, 1), 0, stream>>>(
+        (const char *) src1->data, (char *) dst->data,
+        src0->ne[0], ne1, n1t,
+        src1->nb[0], src1->nb[1], dst->nb[0], dst->nb[1]);
+
+    if (src0->ne[0] > 0) {
+        const int64_t block = 256;
+        concat_dim0_copy_src0<T><<<(ne1 + block - 1) / block, block, 0, stream>>>(
+            (const char *) src0->data, (char *) dst->data,
+            src0->ne[0], ne1, src0->nb[0], src0->nb[1], dst->nb[0], dst->nb[1]);
+    }
+    return true;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +269,10 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (concat_try_dim0_transpose<T>(src0, src1, dst, dim, stream)) {
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

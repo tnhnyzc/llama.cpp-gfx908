@@ -336,6 +336,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             return true;
         }
         if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) {
+            // CDNA1 (gfx908) has int8 == fp16 throughput, unlike CDNA2/3 where int8
+            // is 2x. So MMQ has no arithmetic edge here and loses badly to
+            // dequantise + rocBLAS once the batch is large enough to be
+            // compute-bound. Measured on Gemma4-31B (100% Q4_0 despite its
+            // "Q4_K_XL" name): pp4096 510 -> 1037 t/s. Keep MMQ for decode-sized
+            // batches, where it is still ahead.
+            if (GGML_CUDA_CC_IS_CDNA1(cc)) {
+                return ne11 <= 256;
+            }
             return true;
         }
         if (ne11 <= 256 && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
