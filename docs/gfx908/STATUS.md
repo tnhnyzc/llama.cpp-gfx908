@@ -54,6 +54,12 @@ experimental.
   no corresponding rewrite is retained.
 - MXFP4 and IQ2_S full-server probes on offloaded MoE models cannot isolate GPU
   MMVQ performance and are not treated as kernel conclusions.
+- Global MMVQ `__launch_bounds__` occupancy forcing is rejected. Compiler
+  metadata showed 119 of 325 variants spilling, with up to 592 bytes of scratch;
+  this tested register starvation rather than clean occupancy scaling.
+- The tested small-N 4x4x4 INT8 MFMA layout required LDS staging that alone cost
+  1.73 times the complete dp4a reference. This rejects that staging design, not
+  every possible small-N MFMA layout.
 - Broad compiler flags, XNACK targeting, larger MMVQ wave counts, and the tested
   manual software-prefetch variants were neutral or negative.
 

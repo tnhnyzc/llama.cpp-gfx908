@@ -36,9 +36,10 @@ This includes both configuration and code improvements.
 
 ## Original upstream baseline
 
-The recorded raw runs use upstream commit
-`e8e6c7af2456fd50bb62f7a2bbd642e6fb14ae77`, ROCm
-`7.15.0a20260720`, full GPU offload, flash attention and no speculation:
+The recorded raw runs use unmodified upstream mainline llama.cpp build 10095 at
+commit `e8e6c7af2456fd50bb62f7a2bbd642e6fb14ae77`, compiled against ROCm
+`7.15.0a20260720`, with full GPU offload, flash attention and no speculation.
+They are not results from the separate Lemonade build:
 
 ```text
 llama-bench -p 128,512,2048,8192 -n 128 -r 5 -ngl 999 -fa auto
@@ -143,6 +144,27 @@ That model was not referenced by the daily llama-swap profiles. On the served
 IQ4_NL model, Q5_K has a much smaller surface, so this number must not be carried
 over as the daily profile's expected gain.
 
+### IQ4_NL memory counters
+
+One dispatch of the dominant IQ4_NL FFN MMVQ kernel was profiled at
+`m=17408, k=5120`:
+
+| Counter/result | Value |
+|---|---:|
+| DRAM bytes read | 50.1 MB, matching the tensor weight size |
+| Duration | 63.8 us |
+| Achieved DRAM bandwidth | 786 GB/s |
+| L2 hit rate | 14.0% |
+| DRAM-credit stall | 0.00% |
+| Average TCP-to-TCC read latency | 375 cycles |
+| TCP pending-stall cycles | 76.6% of measured TCC cycles |
+
+The DRAM-credit counter was checked against a nonzero request-level counter
+from the same profiler pass. These counters support an outstanding-request and
+latency-hiding limit for this dispatch, not saturation of the memory
+controller. The conclusion is intentionally scoped to the measured gfx908
+kernel; cross-backend impact remains unmeasured.
+
 ## Deployment observations
 
 These are useful real-world bounds but not clean A/B measurements:
@@ -151,21 +173,24 @@ These are useful real-world bounds but not clean A/B measurements:
   10k prefill with `-ub 4096`; larger recorded contexts declined as expected.
 - Qwen3.6-27B IQ4_NL reached approximately 1.42k tok/s in the comparable
   service workload.
-- Gemma4-31B measured 1078.3 tok/s at pp4096, 1047.1 at pp8192 and 751.4 at
-  pp32768. Its pp4096 baseline was 510.1 tok/s before CDNA1 batch routing and
-  wave64 dequantization. A real server request at roughly 20k prompt tokens
-  reached 757.4 tok/s.
+- Gemma 4 31B QAT (Q4_0-based) measured 1078.3 tok/s at pp4096, 1047.1 at
+  pp8192 and 751.4 at pp32768. Its pp4096 baseline was 510.1 tok/s before CDNA1
+  batch routing and wave64 dequantization. A real server request at roughly 20k
+  prompt tokens reached 757.4 tok/s.
 - Low-context MTP generation reached about 50-52 tok/s Q6_K and 58-61 tok/s
   IQ4_NL. Compared with the upstream service baselines of 40.55 and
   51.07 tok/s, those ranges are roughly +23-28% and +14-19%. This is a useful
   daily-use comparison, but not a controlled MTP-only A/B because prompts,
   cache state and acceptance differed. Long-context attention and speculative
   acceptance also reduce those rates.
-- Gemma4-31B Q4-based service decode reached about 45-46.5 tok/s at shallow
-  context and about 37.5 tok/s after a roughly 20k-token prefill.
+- Gemma 4 31B QAT (Q4_0-based) service decode reached about 45-46.5 tok/s at
+  shallow context and about 37.5 tok/s after a roughly 20k-token prefill.
 - Offloaded GPT-OSS-120B reached roughly 36-40 tok/s depending on warm state and
   CPU contention. Its GPU kernel performance cannot be inferred directly from
   this whole-server result because many experts reside on CPU.
+- The offloaded Step 3.7 Flash anchor uses a mixed quant at approximately 3.0
+  BPW. Although its filename says `UD-IQ3_XXS`, its weight bytes are mostly
+  IQ2_S and IQ3_S; IQ3_XXS is only the filename's size-class label.
 
 ## Artifact policy
 

@@ -59,6 +59,30 @@ These rules are reflected in the regression tests and architecture guards.
 - Long-context quantized attention had a separate wave64 subgroup gap and now
   gains approximately 2-4% whole-model TG at the measured depths.
 
+### Decode memory-system result
+
+A counter profile of the dominant IQ4_NL FFN MMVQ dispatch at
+`m=17408, k=5120` read 50.1 MB from DRAM, matching the tensor's weight size,
+in 63.8 us. That is 786 GB/s with a 14% L2 hit rate. The same profile recorded:
+
+- zero `TCC_EA0_RDREQ_DRAM_CREDIT_STALL`;
+- approximately 375 cycles of TCP-to-TCC read latency; and
+- `TCP_PENDING_STALL_CYCLES` during 76.6% of measured TCC cycles.
+
+For this kernel, the limiting behavior was outstanding-request capacity and
+latency hiding rather than a saturated HBM controller. This makes the earlier
+913-992 GB/s result a useful observed streaming range, not a hard MMVQ
+bandwidth ceiling. It does not establish that every decode kernel, model or
+backend has the same limit.
+
+Static source and ISA analysis provides a plausible mechanism. Several compact
+quant blocks have 17-, 18- or 34-byte strides and use load helpers that remain
+safe at two-byte alignment; the measured gfx908 loop consequently contains
+narrow weight loads. Wider IQ4_NL loads recovered approximately 4.8-6.0% in
+the tested path, but a repacked or software-pipelined layout remains a
+hypothesis rather than a validated general solution. The underlying block
+layout is shared source; the measured performance impact is gfx908-specific.
+
 ## Highest-value future work
 
 1. Rebase the clean stack onto current upstream and rerun the test matrix.
