@@ -106,6 +106,7 @@ in [BENCHMARKS.md](BENCHMARKS.md).
 ## Start here
 
 - [BUILD.md](BUILD.md) — build and runtime setup
+- [MIXED-CUDA-HIP.md](MIXED-CUDA-HIP.md) — capacity-first NVIDIA + MI100 setup
 - [STATUS.md](STATUS.md) — enabled, optional, experimental and rejected work
 - [BENCHMARKS.md](BENCHMARKS.md) — test method and recorded measurements
 - [UPSTREAM.md](UPSTREAM.md) — branch and update policy
