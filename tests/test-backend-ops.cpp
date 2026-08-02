@@ -8824,6 +8824,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    // Gemma4-31B exact Q4_0 FFN decode shapes (gate/up and down).
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 5376, 1, 21504, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 21504, 1, 5376, {1, 1}, {1, 1}));
+    // Qwen3.6-35B exact active-expert Q8_0 decode shapes.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 8, false, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 8, false, 2048, 1, 512));
 
 
 #if 0
@@ -9616,6 +9622,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(
         GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 5120, 17408,
         false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_Q4_0, GGML_GLU_OP_GEGLU, 1, 21504, 5376,
+        false, 1, 1, false, false, true, false, {1, 1}));
 
     // Production Qwen3.6 ordinary N=1 MMVQ shapes on gfx908.
     test_cases.emplace_back(new test_mul_mat(
@@ -9626,6 +9635,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 2, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 2, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 2, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 2, 17408, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(
@@ -9778,6 +9799,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 1, 6144, {1, 1}, {1, 1}));     // ssm_out
     test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 2, 5120, {1, 1}, {1, 1}));    // M=2 attn_qkv
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q5_K, GGML_TYPE_F32, 5120, 2, 6144, {1, 1}, {1, 1}));     // M=2 ssm_out
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1, 5120, {1, 1}, {1, 1}));    // ffn gate/up
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 1, 17408, {1, 1}, {1, 1}));    // ffn down
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 2, 5120, {1, 1}, {1, 1}));    // M=2 ffn gate/up
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, 2, 17408, {1, 1}, {1, 1}));    // M=2 ffn down
+    test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q5_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));     // attn_v
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));   // output
@@ -9928,6 +9961,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Gemma4-31B UD-Q4_K_XL stores its dominant dense FFN matrices as Q4_0.
+    for (int bs : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32,
+                    5376, bs, 21504, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32,
+                    21504, bs, 5376, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_Q4_0, GGML_GLU_OP_GEGLU, 1, 21504, 5376,
+        false, 1, 1, false, false, true, false, {1, 1}));
+
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
@@ -9949,6 +9993,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
 
     // gpt-oss-20b
+    for (int bs : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 8, false, 512, bs, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 8, false, 2048, bs, 512));
+    }
+
     for (int bs : {1, 4, 8, 512}) {
         for (ggml_type type_a : {GGML_TYPE_MXFP4}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -9956,6 +10007,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 2880, bs, 2880, 1));
             }
         }
+    }
+
+    // Step-3.7-Flash has 288 routed experts and 8 active. Store only the 8
+    // selected matrices here to keep the perf fixture below its allocation
+    // cap; the launched work and per-expert production shapes are unchanged.
+    // The UD-IQ3_XXS file stores gate/up as IQ2_S and down as IQ3_S.
+    for (int bs : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32,
+                    8, 8, false, 1280, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32,
+                    8, 8, false, 4096, bs, 1280));
     }
 
     for (int K : {3, 5}) {
