@@ -29,7 +29,8 @@ into, and what should not be mistaken for a production result.
 - `GGML_HIP_IQ4_NL_FUSED_GFX908=1`: exact Qwen FFN IQ4_NL prefill route for
   qualified M values. This is shape-specific, not a universal IQ4 kernel.
 - `GGML_HIP_GDN_CHUNK_GFX908=1`: exact-shape chunked Qwen GDN prefill. Requires
-  the external HSACO directory described in BUILD.md.
+  `GGML_HIP_GDN_CHUNK_GFX908_DIR` to reference the verified runtime packaged in
+  `build-prod/runtime/gdn`.
 - `GGML_HIP_Q5_K_MMQ_N3_GFX908=1`: exact Q5_K speculative-width route.
 - `GGML_HIP_DISABLE_GFX908_M2_GATE_FUSION=1`: disables the IQ4_NL M=2 gate/up
   fusion when the selected workload performs better without it.
@@ -69,12 +70,17 @@ into, and what should not be mistaken for a production result.
 - Experimental branches remain in Git; they do not require persistent
   worktrees or build products.
 
+The 2026-08-02 canonical release is commit `387c97018`. Its ROCm MUL_MAT fence
+passed 1,216/1,216 cases, Qwen Q6 and IQ4_NL started with that fingerprint, and
+a 3,799-token native-tool prompt exercised chunked GDN without the former HSACO
+lookup failure. All llama.cpp MI100 profiles in llama-swap use this release.
+
 ## Open portability work
 
 - Package the chunked GDN kernel source and reproducible HSACO build process.
 - Add CI that at least compiles the HIP/gfx908 target; hardware performance CI
   is not currently available.
-- Rebase onto current upstream and repeat the complete oracle before changing
-  the production branch.
+- Rebase onto future upstream updates and repeat the complete oracle before
+  changing the production branch.
 - Re-check generic paths touched by the old production tree and add explicit
   CDNA1 guards wherever the optimization is not intended for CUDA/RDNA.
