@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "gdn-chunk-sm86.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -292,6 +293,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+    }
+
+    if (try_launch_gdn_chunk_sm86(
+            ctx,
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1, rq3, kda, keep_rs, scale, stream)) {
+        return;
     }
 
     if (kda) {
