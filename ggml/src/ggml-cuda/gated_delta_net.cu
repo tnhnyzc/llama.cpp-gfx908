@@ -3,18 +3,19 @@
 
 #if defined(GGML_USE_HIP)
 
-// Experimental gfx908/Qwen GDN prefill bridge.  The five kernels are fixed-shape
-// FP16 Triton/FLA kernels compiled for gfx908 and are loaded only when explicitly
-// enabled.  The ordinary recurrent kernel remains the default and handles every
-// non-matching shape.
+// Experimental gfx908/Qwen GDN prefill bridge.  The six kernels are fixed-shape
+// Triton/FLA kernels compiled for gfx908 and are loaded only when explicitly
+// enabled.  This is a feasibility path; the ordinary recurrent kernel remains
+// the default and handles every non-matching shape.
 struct gdn_chunk_gfx908_modules {
-    hipModule_t   modules[5]   = {};
-    hipFunction_t functions[5] = {};
+    hipModule_t   modules[6]   = {};
+    hipFunction_t functions[6] = {};
 };
 
 enum gdn_chunk_gfx908_kernel {
     GDN_CHUNK_CUMSUM,
-    GDN_CHUNK_KKT_SOLVE,
+    GDN_CHUNK_KKT,
+    GDN_CHUNK_TRIL,
     GDN_CHUNK_WU,
     GDN_CHUNK_H,
     GDN_CHUNK_O,
@@ -28,24 +29,26 @@ static gdn_chunk_gfx908_modules & get_gdn_chunk_gfx908_modules() {
         const char * env_dir = std::getenv("GGML_HIP_GDN_CHUNK_GFX908_DIR");
         const std::string dir = env_dir != nullptr
             ? env_dir
-            : "/home/llm/mi100/triton-gdn-gfx908-f16-vfirst-modulo";
+            : "/home/llm/mi100/triton-gdn-gfx908";
 
-        const char * files[5] = {
+        const char * files[6] = {
             "chunk_local_cumsum_scalar_kernel.hsaco",
-            "chunk_gated_delta_rule_fwd_kkt_solve_kernel.hsaco",
+            "chunk_scaled_dot_kkt_fwd_kernel.hsaco",
+            "merge_16x16_to_64x64_inverse_kernel.hsaco",
             "recompute_w_u_fwd_kernel.hsaco",
             "chunk_gated_delta_rule_fwd_kernel_h_blockdim64.hsaco",
             "chunk_fwd_kernel_o.hsaco",
         };
-        const char * names[5] = {
+        const char * names[6] = {
             "chunk_local_cumsum_scalar_kernel",
-            "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+            "chunk_scaled_dot_kkt_fwd_kernel",
+            "merge_16x16_to_64x64_inverse_kernel",
             "recompute_w_u_fwd_kernel",
             "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
             "chunk_fwd_kernel_o",
         };
 
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             const std::string path = dir + "/" + files[i];
             if (std::getenv("GGML_HIP_GDN_CHUNK_GFX908_DEBUG") != nullptr) {
                 std::fprintf(stderr, "gdn-chunk loading %s\n", path.c_str());
@@ -76,7 +79,7 @@ static __global__ void gdn_chunk_convert_f16(const half * src, float * dst, size
     }
 }
 
-static __global__ void gdn_chunk_pack_v_f16(
+static __global__ void gdn_chunk_pack_v_f32(
         const float * src, half * dst, size_t n, int64_t sv1, int64_t sv2) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -167,6 +170,7 @@ static bool try_launch_gdn_chunk_gfx908(
     ggml_cuda_pool_alloc<half>  k_h(ctx.pool(), qk_count);
     ggml_cuda_pool_alloc<half>  v_h(ctx.pool(), vh_count);
     ggml_cuda_pool_alloc<float> g_cum(ctx.pool(), gate_count);
+    ggml_cuda_pool_alloc<float> a_f32(ctx.pool(), a_count);
     ggml_cuda_pool_alloc<half>  a_inv(ctx.pool(), a_count);
     ggml_cuda_pool_alloc<half>  w_h(ctx.pool(), vh_count);
     ggml_cuda_pool_alloc<half>  u_h(ctx.pool(), vh_count);
@@ -179,7 +183,7 @@ static bool try_launch_gdn_chunk_gfx908(
         q, q_h.get(), qk_count);
     gdn_chunk_convert_f32<<<(qk_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
         k, k_h.get(), qk_count);
-    gdn_chunk_pack_v_f16<<<(vh_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
+    gdn_chunk_pack_v_f32<<<(vh_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
         v, v_h.get(), vh_count, sv1, sv2);
     CUDA_CHECK(cudaGetLastError());
 
@@ -193,26 +197,29 @@ static bool try_launch_gdn_chunk_gfx908(
     {
         const float * g_arg = g;
         float * gc_arg = g_cum.get();
-        const float cumsum_scale = 1.4426950408889634f;
-        void * args[] = {
-            &g_arg, &gc_arg, (void *) &cumsum_scale, (void *) &T,
-            &global_scratch, &profile_scratch
-        };
+        void * args[] = {&g_arg, &gc_arg, (void *) &T, &global_scratch, &profile_scratch};
         gdn_chunk_launch_module("cumsum", modules.functions[GDN_CHUNK_CUMSUM],
             NT, 48, 1, 64, 0, stream, args);
     }
-    CUDA_CHECK(cudaMemsetAsync(a_inv.get(), 0, a_count * sizeof(half), stream));
     {
         half * k_arg = k_h.get();
-        float * gc_arg = g_cum.get();
         const float * beta_arg = beta;
-        half * a_arg = a_inv.get();
+        float * gc_arg = g_cum.get();
+        float * a_arg = a_f32.get();
         void * args[] = {
-            &k_arg, &gc_arg, &beta_arg, &a_arg, (void *) &T,
-            &global_scratch, &profile_scratch
+            &k_arg, &beta_arg, &gc_arg, &a_arg, (void *) &T, &global_scratch, &profile_scratch
         };
-        gdn_chunk_launch_module("kkt-solve", modules.functions[GDN_CHUNK_KKT_SOLVE],
-            NT, 48, 1, 64, 6144, stream, args);
+        gdn_chunk_launch_module("kkt", modules.functions[GDN_CHUNK_KKT],
+            NT, 48, 1, 256, 8192, stream, args);
+    }
+
+    CUDA_CHECK(cudaMemsetAsync(a_inv.get(), 0, a_count * sizeof(half), stream));
+    {
+        float * a_arg = a_f32.get();
+        half * ai_arg = a_inv.get();
+        void * args[] = {&a_arg, &ai_arg, (void *) &T, &global_scratch, &profile_scratch};
+        gdn_chunk_launch_module("tril", modules.functions[GDN_CHUNK_TRIL],
+            NT, 48, 1, 128, 3072, stream, args);
     }
     {
         half * k_arg = k_h.get();
@@ -227,7 +234,7 @@ static bool try_launch_gdn_chunk_gfx908(
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("wu", modules.functions[GDN_CHUNK_WU],
-            NT, 48, 1, 256, 16384, stream, args);
+            NT, 48, 1, 128, 8192, stream, args);
     }
     {
         half * k_arg = k_h.get();
@@ -243,7 +250,7 @@ static bool try_launch_gdn_chunk_gfx908(
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("h", modules.functions[GDN_CHUNK_H],
-            4, 48, 1, 128, 8192, stream, args);
+            2, 48, 1, 256, 49152, stream, args);
     }
     {
         half * q_arg = q_h.get();
@@ -257,7 +264,7 @@ static bool try_launch_gdn_chunk_gfx908(
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("o", modules.functions[GDN_CHUNK_O],
-            1, NT, 48, 512, 32768, stream, args);
+            2, NT, 48, 256, 24576, stream, args);
     }
 
     gdn_chunk_convert_f16<<<(vh_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
@@ -570,61 +577,6 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 
 #if defined(GGML_USE_HIP)
-    // Retained-state mode (used by speculative decoding) needs K rollback
-    // snapshots, while the chunk kernel returns only its final state.  Process
-    // the large prefix with the chunk kernel, then run a recurrent correction
-    // tail to populate every rollback slot.  A tail larger than K can be used
-    // to damp FP16 chunk-state drift before generation begins.
-    if (keep_rs && !kda && n_seqs == 1 && n_tokens > K) {
-        int64_t tail_tokens = K;
-        if (const char * tail_env = std::getenv("GGML_HIP_GDN_CHUNK_GFX908_RS_TAIL")) {
-            const int64_t requested_tail = std::atoll(tail_env);
-            if (requested_tail > tail_tokens) {
-                tail_tokens = requested_tail;
-            }
-        }
-        if (tail_tokens > n_tokens) {
-            tail_tokens = n_tokens;
-        }
-        const int64_t prefix_tokens = n_tokens - tail_tokens;
-
-        if (prefix_tokens >= 64) {
-            ggml_cuda_pool_alloc<float> prefix_state(
-                ctx.pool(), (size_t) S_v * S_v * H * n_seqs);
-
-            if (try_launch_gdn_chunk_gfx908(
-                    ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefix_state.get(),
-                    S_v, H, prefix_tokens, n_seqs,
-                    sq1, sq2, prefix_tokens * sq2,
-                    sv1, sv2, prefix_tokens * sv2,
-                    sb1, sb2, prefix_tokens * sb2,
-                    neqk1, rq3, kda, false, scale, stream)) {
-                const float * q_tail = q_d + prefix_tokens * sq2;
-                const float * k_tail = k_d + prefix_tokens * sq2;
-                const float * v_tail = v_d + prefix_tokens * sv2;
-                const float * g_tail = g_d + prefix_tokens * sb2;
-                const float * b_tail = b_d + prefix_tokens * sb2;
-                float * dst_tail = dst_d + prefix_tokens * S_v * H;
-
-                if (std::getenv("GGML_HIP_GDN_CHUNK_GFX908_DEBUG") != nullptr) {
-                    std::fprintf(stderr,
-                        "gdn-chunk retained-state split: prefix=%lld tail=%lld K=%d\n",
-                        (long long) prefix_tokens, (long long) tail_tokens, K);
-                }
-
-                launch_gated_delta_net<false, true>(
-                    q_tail, k_tail, v_tail, g_tail, b_tail, prefix_state.get(),
-                    dst_tail, state_d,
-                    S_v, H, tail_tokens, n_seqs,
-                    sq1, sq2, tail_tokens * sq2,
-                    sv1, sv2, tail_tokens * sv2,
-                    sb1, sb2, tail_tokens * sb2,
-                    neqk1, rq3, scale, state_slot_stride, K, stream);
-                return;
-            }
-        }
-    }
-
     if (try_launch_gdn_chunk_gfx908(
             ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
             S_v, H, n_tokens, n_seqs,

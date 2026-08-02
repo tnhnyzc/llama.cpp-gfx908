@@ -223,10 +223,17 @@ static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
+static __global__ void dequantize_block_iq4_nl(
+        const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    // IQ4_NL has one 32-thread decode unit per QK_K=256 values. On wave64
+    // hardware, place two independent decode units in one physical wave so
+    // all lanes are useful rather than launching a half-active wave.
+    const int64_t i = 2*blockIdx.x + threadIdx.x/32;
+    if (i >= nb) {
+        return;
+    }
 
-    dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
+    dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x % 32);
 }
 
 template<typename dst_t>
@@ -353,7 +360,12 @@ static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 64 && GGML_CUDA_CC_IS_CDNA(cc)) {
+        dequantize_block_iq4_nl<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+    } else {
+        dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y, nb);
+    }
 }
 
 template<typename dst_t>
