@@ -4,6 +4,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1515,6 +1516,17 @@ void ggml_cuda_mul_mat_vec_q(
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
+    if (std::getenv("GGML_HIP_MMVQ_TRACE_SRC1") != nullptr) {
+        static uint64_t call_no = 0;
+        std::fprintf(stderr,
+            "MMVQ_SRC1 call=%llu stream=%d src1=%p name=\"%s\" type=%d fusion=%d "
+            "ne10=%lld ne11=%lld ne12=%lld ne13=%lld nb11=%zu nb12=%zu nb13=%zu\n",
+            (unsigned long long) call_no++, ctx.curr_stream_no, (const void *) src1->data, src1->name,
+            (int) src0->type, fusion != nullptr,
+            (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+            src1->nb[1], src1->nb[2], src1->nb[3]);
+    }
+
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
@@ -1573,12 +1585,55 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1_local;
+    char * src1_q8_1_d = nullptr;
+
+    const bool reuse_q8 =
+        std::getenv("GGML_HIP_MMVQ_Q8_REUSE") != nullptr &&
+        std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr &&
+        ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_CDNA1;
+
+    bool cache_hit = false;
+    if (reuse_q8) {
+        auto & entry = ctx.mmvq_q8_cache[ctx.curr_stream_no];
+        cache_hit =
+            entry.ptr != nullptr && entry.src1_data == src1->data &&
+            entry.src0_type == src0->type &&
+            entry.ne[0] == ne10 && entry.ne[1] == ne11 && entry.ne[2] == ne12 && entry.ne[3] == ne13 &&
+            entry.nb[0] == src1->nb[0] && entry.nb[1] == src1->nb[1] &&
+            entry.nb[2] == src1->nb[2] && entry.nb[3] == src1->nb[3];
+
+        if (!cache_hit) {
+            if (entry.ptr != nullptr) {
+                entry.pool->free(entry.ptr, entry.actual_size);
+            }
+            entry = {};
+            entry.pool = &ctx.pool();
+            entry.ptr = (char *) entry.pool->alloc(src1_q8_1_size, &entry.actual_size);
+            entry.src1 = src1;
+            entry.src1_data = src1->data;
+            entry.src0_type = src0->type;
+            for (int i = 0; i < 4; ++i) {
+                entry.ne[i] = src1->ne[i];
+                entry.nb[i] = src1->nb[i];
+            }
+        }
+        src1_q8_1_d = entry.ptr;
+    } else {
+        src1_q8_1_d = src1_q8_1_local.alloc(ctx.pool(), src1_q8_1_size);
+    }
+
+    if (std::getenv("GGML_HIP_MMVQ_TRACE_REUSE") != nullptr) {
+        std::fprintf(stderr, "MMVQ_REUSE enabled=%d hit=%d ctx=%p stream=%d src1=%p name=\"%s\"\n",
+            reuse_q8, cache_hit, (void *) &ctx, ctx.curr_stream_no, (const void *) src1->data, src1->name);
+    }
+
+    if (!cache_hit) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1604,7 +1659,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

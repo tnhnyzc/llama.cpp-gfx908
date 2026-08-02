@@ -1473,6 +1473,17 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_mmvq_q8_cache_entry {
+    ggml_cuda_pool * pool = nullptr;
+    char * ptr = nullptr;
+    size_t actual_size = 0;
+    const ggml_tensor * src1 = nullptr;
+    const void * src1_data = nullptr;
+    ggml_type src0_type = GGML_TYPE_COUNT;
+    int64_t ne[4] = {};
+    size_t nb[4] = {};
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1571,6 +1582,7 @@ struct ggml_backend_cuda_context {
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_mmvq_q8_cache_entry mmvq_q8_cache[GGML_CUDA_MAX_STREAMS];
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
@@ -1583,6 +1595,15 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_pool & pool() {
         return pool(device);
+    }
+
+    void reset_mmvq_q8_cache() {
+        for (auto & entry : mmvq_q8_cache) {
+            if (entry.ptr != nullptr) {
+                entry.pool->free(entry.ptr, entry.actual_size);
+            }
+            entry = {};
+        }
     }
 };
 
@@ -1727,4 +1748,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
