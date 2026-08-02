@@ -912,73 +912,6 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
 }
 
-// Compute the two M=2 columns while the packed Q4_K block and its scale
-// metadata are live. This avoids decoding/loading the same weight block once
-// per destination column. The q8 inputs remain separate.
-static __device__ __forceinline__ void vec_dot_q4_K_q8_1_m2(
-    const void * __restrict__ vbq,
-    const block_q8_1 * __restrict__ bq8_1_0,
-    const block_q8_1 * __restrict__ bq8_1_1,
-    const int & kbx, const int & iqs, float & result_0, float & result_1) {
-
-    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
-
-    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
-    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    const int v0 = q4[0];
-    const int v1 = q4[4];
-
-    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
-    uint16_t aux[2];
-    const int j = bq8_offset/2;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
-    const uint8_t * sc = (const uint8_t *) aux;
-    const uint8_t * m  = sc + 2;
-
-    float sumf_d_0 = 0.0f;
-    float sumf_m_0 = 0.0f;
-    float sumf_d_1 = 0.0f;
-    float sumf_m_1 = 0.0f;
-
-#pragma unroll
-    for (int i = 0; i < QR4_K; ++i) {
-        const int v0i = (v0 >> (4*i)) & 0x0F0F0F0F;
-        const int v1i = (v1 >> (4*i)) & 0x0F0F0F0F;
-
-        const block_q8_1 * bq8i_0 = bq8_1_0 + bq8_offset + i;
-        const block_q8_1 * bq8i_1 = bq8_1_1 + bq8_offset + i;
-        const int * q8_0 = (const int *) bq8i_0->qs + ((iqs/2)%4);
-        const int * q8_1 = (const int *) bq8i_1->qs + ((iqs/2)%4);
-
-        const int u00 = q8_0[0];
-        const int u01 = q8_0[4];
-        const int u10 = q8_1[0];
-        const int u11 = q8_1[4];
-
-        const int dot_d_0 = ggml_cuda_dp4a(v1i, u01, ggml_cuda_dp4a(v0i, u00, 0));
-        const int dot_m_0 = ggml_cuda_dp4a(0x01010101, u01, ggml_cuda_dp4a(0x01010101, u00, 0));
-        const int dot_d_1 = ggml_cuda_dp4a(v1i, u11, ggml_cuda_dp4a(v0i, u10, 0));
-        const int dot_m_1 = ggml_cuda_dp4a(0x01010101, u11, ggml_cuda_dp4a(0x01010101, u10, 0));
-
-        const float d8_0 = __low2float(bq8i_0->ds);
-        const float d8_1 = __low2float(bq8i_1->ds);
-        sumf_d_0 += d8_0 * (dot_d_0 * sc[i]);
-        sumf_m_0 += d8_0 * (dot_m_0 * m[i]);
-        sumf_d_1 += d8_1 * (dot_d_1 * sc[i]);
-        sumf_m_1 += d8_1 * (dot_m_1 * m[i]);
-    }
-
-    const float2 dm4f = __half22float2(bq4_K->dm);
-    result_0 = dm4f.x*sumf_d_0 - dm4f.y*sumf_m_0;
-    result_1 = dm4f.x*sumf_d_1 - dm4f.y*sumf_m_1;
-}
-
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1049,45 +982,6 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
-}
-
-static __device__ __forceinline__ void vec_dot_q6_K_q8_1_m2(
-    const void * __restrict__ vbq,
-    const block_q8_1 * __restrict__ bq8_1_0,
-    const block_q8_1 * __restrict__ bq8_1_1,
-    const int & kbx, const int & iqs, float & result_0, float & result_1) {
-
-    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
-
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
-    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
-
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
-    const int8_t * scales = bq6_K->scales + scale_offset;
-
-    float sumf_0 = 0.0f;
-    float sumf_1 = 0.0f;
-#pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
-        const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
-        const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
-        const int vi = __vsubss4((vil | vih), 0x20202020);
-
-        const block_q8_1 * bq8i_0 = bq8_1_0 + bq8_offset + 2*i;
-        const block_q8_1 * bq8i_1 = bq8_1_1 + bq8_offset + 2*i;
-        const int u_0 = get_int_b4(bq8i_0->qs, iqs % QI8_1);
-        const int u_1 = get_int_b4(bq8i_1->qs, iqs % QI8_1);
-        const int sc = scales[4*i];
-
-        sumf_0 += __low2float(bq8i_0->ds) * (ggml_cuda_dp4a(vi, u_0, 0) * sc);
-        sumf_1 += __low2float(bq8i_1->ds) * (ggml_cuda_dp4a(vi, u_1, 0) * sc);
-    }
-
-    const float d = bq6_K->d;
-    result_0 = d * sumf_0;
-    result_1 = d * sumf_1;
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
@@ -1397,34 +1291,6 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 
     const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
     return d * sumi;
-}
-
-static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_m2(
-    const void * __restrict__ vbq,
-    const block_q8_1 * __restrict__ bq8_1_0,
-    const block_q8_1 * __restrict__ bq8_1_1,
-    const int & kbx, const int & iqs, float & result_0, float & result_1) {
-
-    const block_iq4_nl * bq4 = (const block_iq4_nl *) vbq + kbx;
-    const int * q8_0 = (const int *) bq8_1_0->qs + iqs;
-    const int * q8_1 = (const int *) bq8_1_1->qs + iqs;
-
-    int sumi_0 = 0;
-    int sumi_1 = 0;
-#pragma unroll
-    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
-
-        sumi_0 = ggml_cuda_dp4a(v.x, q8_0[l + 0], sumi_0);
-        sumi_0 = ggml_cuda_dp4a(v.y, q8_0[l + 4], sumi_0);
-        sumi_1 = ggml_cuda_dp4a(v.x, q8_1[l + 0], sumi_1);
-        sumi_1 = ggml_cuda_dp4a(v.y, q8_1[l + 4], sumi_1);
-    }
-
-    const float d = __half2float(bq4->d);
-    result_0 = d * __low2float(bq8_1_0->ds) * sumi_0;
-    result_1 = d * __low2float(bq8_1_1->ds) * sumi_1;
 }
 
 #define VDR_IQ4_XS_Q8_1_MMVQ 4

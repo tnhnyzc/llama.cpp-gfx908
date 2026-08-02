@@ -51,14 +51,15 @@ static __device__ __forceinline__ iq4_fused_halfx4_t iq4_fused_u8x4_to_scaled_ha
     return result;
 }
 
-template<bool tail, int block_cols = 128>
-__launch_bounds__(64 * (block_cols / 32), 1)
+template<bool tail>
+__launch_bounds__(256, 1)
 static __global__ void iq4_nl_fp16_mfma_gfx908_exact(
         const block_iq4_nl * __restrict__ x,
         const half2 * __restrict__ yh,
         float * __restrict__ dst,
         const int k, const int nrows, const int m) {
     constexpr int block_rows = 128;
+    constexpr int block_cols = 128;
     constexpr int k_tile = 64;
     constexpr int smem_stride = 72;
 
@@ -83,21 +84,12 @@ static __global__ void iq4_nl_fp16_mfma_gfx908_exact(
                              iq4_fused_halfx8_t * gb,
                              _Float16 & qd,
                              iq4_fused_uintx4_t & qraw) {
-        if constexpr (block_cols == 128) {
-            const int r = tid >> 1;
-            const int qb = tid & 1;
-            const block_iq4_nl & b =
-                x[(int64_t)(row0 + r) * blocks_per_row + load_kt / 32 + qb];
-            qd = *reinterpret_cast<const _Float16 *>(&b.d);
-            qraw = *reinterpret_cast<const iq4_fused_uintx4_t *>(b.qs);
-        } else if (tid < block_rows * 2) {
-            const int r = tid >> 1;
-            const int qb = tid & 1;
-            const block_iq4_nl & b =
-                x[(int64_t)(row0 + r) * blocks_per_row + load_kt / 32 + qb];
-            qd = *reinterpret_cast<const _Float16 *>(&b.d);
-            qraw = *reinterpret_cast<const iq4_fused_uintx4_t *>(b.qs);
-        }
+        const int r = tid >> 1;
+        const int qb = tid & 1;
+        const block_iq4_nl & b =
+            x[(int64_t)(row0 + r) * blocks_per_row + load_kt / 32 + qb];
+        qd = *reinterpret_cast<const _Float16 *>(&b.d);
+        qraw = *reinterpret_cast<const iq4_fused_uintx4_t *>(b.qs);
 
         const _Float16 * yhh = reinterpret_cast<const _Float16 *>(yh);
 #pragma unroll
@@ -140,22 +132,12 @@ static __global__ void iq4_nl_fp16_mfma_gfx908_exact(
         decode_raw_group(qd, qraw, ga, group);
     }
 
-    if constexpr (block_cols == 128) {
-        const int r = tid >> 1;
-        const int qb = tid & 1;
+    const int r = tid >> 1;
+    const int qb = tid & 1;
 #pragma unroll
-        for (int group = 0; group < 4; ++group) {
-            *reinterpret_cast<iq4_fused_halfx8_t *>(
-                &sh_a[r * smem_stride + qb * 32 + group * 8]) = ga[group];
-        }
-    } else if (tid < block_rows * 2) {
-        const int r = tid >> 1;
-        const int qb = tid & 1;
-#pragma unroll
-        for (int group = 0; group < 4; ++group) {
-            *reinterpret_cast<iq4_fused_halfx8_t *>(
-                &sh_a[r * smem_stride + qb * 32 + group * 8]) = ga[group];
-        }
+    for (int group = 0; group < 4; ++group) {
+        *reinterpret_cast<iq4_fused_halfx8_t *>(
+            &sh_a[r * smem_stride + qb * 32 + group * 8]) = ga[group];
     }
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
@@ -190,8 +172,7 @@ static __global__ void iq4_nl_fp16_mfma_gfx908_exact(
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 B8[ks][j] = *reinterpret_cast<const iq4_fused_halfx8_t *>(
-                    &sh_b[(wave_col + j * (block_cols / 2) + matrix_lane)
-                          * smem_stride + kk + k_lane]);
+                    &sh_b[(wave_col + j * 64 + matrix_lane) * smem_stride + kk + k_lane]);
             }
         }
 
@@ -259,19 +240,9 @@ static __global__ void iq4_nl_fp16_mfma_gfx908_exact(
 
                 if (kt + k_tile < k) {
                     const int store_group = (ks - 2) * 2 + phase;
-                    if constexpr (block_cols == 128) {
-                        const int r = tid >> 1;
-                        const int qb = tid & 1;
-                        *reinterpret_cast<iq4_fused_halfx8_t *>(
-                            &sh_a[r * smem_stride + qb * 32 + store_group * 8]) =
-                                next_ga[store_group];
-                    } else if (tid < block_rows * 2) {
-                        const int r = tid >> 1;
-                        const int qb = tid & 1;
-                        *reinterpret_cast<iq4_fused_halfx8_t *>(
-                            &sh_a[r * smem_stride + qb * 32 + store_group * 8]) =
-                                next_ga[store_group];
-                    }
+                    *reinterpret_cast<iq4_fused_halfx8_t *>(
+                        &sh_a[r * smem_stride + qb * 32 + store_group * 8]) =
+                            next_ga[store_group];
 
                     const int c = wave * 32 + lane / 8 + store_group * 8;
                     const int kv = lane % 8;
@@ -293,8 +264,7 @@ static __global__ void iq4_nl_fp16_mfma_gfx908_exact(
                 const int local_m = (l / 4) * 8 + (lane / 32) * 4 + l % 4;
                 const int local_n = lane % 32;
                 const int row = row0 + wave_row + i * 64 + local_m;
-                const int col =
-                    col0 + wave_col + j * (block_cols / 2) + local_n;
+                const int col = col0 + wave_col + j * 64 + local_n;
                 if constexpr (tail) {
                     if (col < m) {
                         dst[(int64_t)col * nrows + row] = C[i][j][l];
@@ -315,18 +285,6 @@ static inline void ggml_cuda_iq4_nl_fused_gfx908(
 #if defined(GGML_USE_HIP)
     GGML_ASSERT(k % 64 == 0);
     GGML_ASSERT(nrows % 128 == 0);
-    const bool wide_gate =
-        nrows == 17408 && k == 5120 && (m == 512 || m == 768);
-    const bool wide_down =
-        nrows == 5120 && k == 17408 && (m == 512 || m == 768);
-    if (wide_gate || wide_down) {
-        iq4_nl_fp16_mfma_gfx908_exact<false, 256><<<
-            dim3(nrows / 128, m / 256), dim3(64, 8), 0, stream>>>(
-                static_cast<const block_iq4_nl *>(x),
-                reinterpret_cast<const half2 *>(y),
-                dst, k, nrows, m);
-        return;
-    }
     const int full_tiles = m / 128;
     if (full_tiles > 0) {
         iq4_nl_fp16_mfma_gfx908_exact<false><<<
