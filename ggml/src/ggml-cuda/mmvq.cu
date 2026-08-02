@@ -483,7 +483,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, int c_rows_override = 0>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -502,7 +502,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
-    constexpr int rows_per_cuda_block = c_rows_override > 0 ? c_rows_override : calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -987,32 +987,6 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-// gfx908/CDNA1 experiment: allow overriding rows_per_cuda_block for the
-// ncols_dst=1 decode path via GGML_HIP_MMVQ_ROWS_GFX908 (values >1). More rows
-// per block raises memory-level parallelism and reduces workgroup churn on
-// short decode kernels. Restricted to the types used by the daily models to
-// limit template instantiations.
-static constexpr bool mmvq_rows_override_type_supported(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_Q8_0:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static int mmvq_rows_override_env() {
-    static const int rows = []() {
-        const char * env = std::getenv("GGML_HIP_MMVQ_ROWS_GFX908");
-        return env != nullptr ? std::atoi(env) : 0;
-    }();
-    return rows;
-}
-
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1021,7 +995,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
-        const uint32_t ids_stride, cudaStream_t stream, const int rows_override = 0) {
+        const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
@@ -1044,58 +1018,6 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
     if constexpr (c_ncols_dst == 1) {
-        if constexpr (mmvq_rows_override_type_supported(type)) {
-            if (rows_override > 1) {
-                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-                if (has_fusion) {
-                    switch (rows_override) {
-                        case 2:
-                            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, 2>, launch_params,
-                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                            return;
-                        case 4:
-                            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, 4>, launch_params,
-                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                            return;
-                        case 8:
-                            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, 8>, launch_params,
-                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                            return;
-                        default:
-                            break;
-                    }
-                } else {
-                    switch (rows_override) {
-                        case 2:
-                            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 2>, launch_params,
-                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                            return;
-                        case 4:
-                            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 4>, launch_params,
-                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                            return;
-                        case 8:
-                            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 8>, launch_params,
-                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                            return;
-                        default:
-                            break;
-                    }
-                }
-            }
-        }
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
@@ -1228,23 +1150,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
             } else {
-                const int rows_override = mmvq_rows_override_type_supported(type) &&
-                    cc == GGML_CUDA_CC_CDNA1 ? mmvq_rows_override_env() : 0;
-                std::pair<dim3, dim3> dims;
-                if (rows_override > 1) {
-                    const int nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-                    const int64_t nblocks = (nrows_x + rows_override - 1) / rows_override;
-                    dims.first  = dim3(nblocks, nchannels_dst, nsamples_dst);
-                    dims.second = dim3(warp_size, nwarps, 1);
-                } else {
-                    dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                    nsamples_dst, warp_size, table_id);
-                }
+                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                                                                        nsamples_dst, warp_size, table_id);
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
-                    stream, rows_override);
+                    stream);
             }
         } break;
         case 2: {

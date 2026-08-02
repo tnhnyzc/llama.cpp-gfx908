@@ -4,7 +4,7 @@
 #if defined(GGML_USE_HIP)
 
 // Experimental gfx908/Qwen GDN prefill bridge.  The five kernels are fixed-shape
-// FP16 Triton/FLA kernels compiled for gfx908 and are loaded only when explicitly
+// FP32 Triton/FLA kernels compiled for gfx908 and are loaded only when explicitly
 // enabled.  The ordinary recurrent kernel remains the default and handles every
 // non-matching shape.
 struct gdn_chunk_gfx908_modules {
@@ -28,7 +28,7 @@ static gdn_chunk_gfx908_modules & get_gdn_chunk_gfx908_modules() {
         const char * env_dir = std::getenv("GGML_HIP_GDN_CHUNK_GFX908_DIR");
         const std::string dir = env_dir != nullptr
             ? env_dir
-            : "/home/llm/mi100/triton-gdn-gfx908-f16-vfirst-modulo";
+            : "/home/llm/mi100/triton-gdn-gfx908-fp32-vfirst-modulo";
 
         const char * files[5] = {
             "chunk_local_cumsum_scalar_kernel.hsaco",
@@ -61,29 +61,14 @@ static gdn_chunk_gfx908_modules & get_gdn_chunk_gfx908_modules() {
     return result;
 }
 
-template <typename dst_t>
-static __global__ void gdn_chunk_convert_f32(const float * src, dst_t * dst, size_t n) {
-    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        dst[i] = (dst_t) src[i];
-    }
-}
-
-static __global__ void gdn_chunk_convert_f16(const half * src, float * dst, size_t n) {
-    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        dst[i] = (float) src[i];
-    }
-}
-
-static __global__ void gdn_chunk_pack_v_f16(
-        const float * src, half * dst, size_t n, int64_t sv1, int64_t sv2) {
+static __global__ void gdn_chunk_pack_v_f32(
+        const float * src, float * dst, size_t n, int64_t sv1, int64_t sv2) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         const size_t col = i % 128;
         const size_t h   = (i / 128) % 48;
         const size_t t   = i / (128 * 48);
-        dst[i] = (half) src[t * sv2 + h * sv1 + col];
+        dst[i] = src[t * sv2 + h * sv1 + col];
     }
 }
 
@@ -157,30 +142,22 @@ static bool try_launch_gdn_chunk_gfx908(
     const int32_t T  = (int32_t) n_tokens;
     const uint32_t NT = (uint32_t) ((n_tokens + 63) / 64);
 
-    const size_t qk_count    = (size_t) n_tokens * 16 * 128;
     const size_t vh_count    = (size_t) n_tokens * 48 * 128;
     const size_t gate_count  = (size_t) n_tokens * 48;
     const size_t a_count     = (size_t) n_tokens * 48 * 64;
     const size_t h_count     = (size_t) NT * 48 * 128 * 128;
 
-    ggml_cuda_pool_alloc<half>  q_h(ctx.pool(), qk_count);
-    ggml_cuda_pool_alloc<half>  k_h(ctx.pool(), qk_count);
-    ggml_cuda_pool_alloc<half>  v_h(ctx.pool(), vh_count);
+    ggml_cuda_pool_alloc<float> v_f32(ctx.pool(), vh_count);
     ggml_cuda_pool_alloc<float> g_cum(ctx.pool(), gate_count);
-    ggml_cuda_pool_alloc<half>  a_inv(ctx.pool(), a_count);
-    ggml_cuda_pool_alloc<half>  w_h(ctx.pool(), vh_count);
-    ggml_cuda_pool_alloc<half>  u_h(ctx.pool(), vh_count);
-    ggml_cuda_pool_alloc<half>  h_h(ctx.pool(), h_count);
-    ggml_cuda_pool_alloc<half>  v_new_h(ctx.pool(), vh_count);
-    ggml_cuda_pool_alloc<half>  out_h(ctx.pool(), vh_count);
+    ggml_cuda_pool_alloc<float> a_inv(ctx.pool(), a_count);
+    ggml_cuda_pool_alloc<float> w_f32(ctx.pool(), vh_count);
+    ggml_cuda_pool_alloc<float> u_f32(ctx.pool(), vh_count);
+    ggml_cuda_pool_alloc<float> h_f32(ctx.pool(), h_count);
+    ggml_cuda_pool_alloc<float> v_new_f32(ctx.pool(), vh_count);
 
     constexpr int convert_threads = 256;
-    gdn_chunk_convert_f32<<<(qk_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
-        q, q_h.get(), qk_count);
-    gdn_chunk_convert_f32<<<(qk_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
-        k, k_h.get(), qk_count);
-    gdn_chunk_pack_v_f16<<<(vh_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
-        v, v_h.get(), vh_count, sv1, sv2);
+    gdn_chunk_pack_v_f32<<<(vh_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
+        v, v_f32.get(), vh_count, sv1, sv2);
     CUDA_CHECK(cudaGetLastError());
 
     auto & modules = get_gdn_chunk_gfx908_modules();
@@ -201,41 +178,41 @@ static bool try_launch_gdn_chunk_gfx908(
         gdn_chunk_launch_module("cumsum", modules.functions[GDN_CHUNK_CUMSUM],
             NT, 48, 1, 64, 0, stream, args);
     }
-    CUDA_CHECK(cudaMemsetAsync(a_inv.get(), 0, a_count * sizeof(half), stream));
+    CUDA_CHECK(cudaMemsetAsync(a_inv.get(), 0, a_count * sizeof(float), stream));
     {
-        half * k_arg = k_h.get();
+        const float * k_arg = k;
         float * gc_arg = g_cum.get();
         const float * beta_arg = beta;
-        half * a_arg = a_inv.get();
+        float * a_arg = a_inv.get();
         void * args[] = {
             &k_arg, &gc_arg, &beta_arg, &a_arg, (void *) &T,
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("kkt-solve", modules.functions[GDN_CHUNK_KKT_SOLVE],
-            NT, 48, 1, 64, 6144, stream, args);
+            NT, 48, 1, 64, 12288, stream, args);
     }
     {
-        half * k_arg = k_h.get();
-        half * v_arg = v_h.get();
+        const float * k_arg = k;
+        float * v_arg = v_f32.get();
         const float * beta_arg = beta;
-        half * w_arg = w_h.get();
-        half * u_arg = u_h.get();
-        half * ai_arg = a_inv.get();
+        float * w_arg = w_f32.get();
+        float * u_arg = u_f32.get();
+        float * ai_arg = a_inv.get();
         float * gc_arg = g_cum.get();
         void * args[] = {
             &k_arg, &v_arg, &beta_arg, &w_arg, &u_arg, &ai_arg, &gc_arg, (void *) &T,
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("wu", modules.functions[GDN_CHUNK_WU],
-            NT, 48, 1, 256, 16384, stream, args);
+            NT, 48, 1, 256, 32768, stream, args);
     }
     {
-        half * k_arg = k_h.get();
-        half * u_arg = u_h.get();
-        half * w_arg = w_h.get();
-        half * vn_arg = v_new_h.get();
+        const float * k_arg = k;
+        float * u_arg = u_f32.get();
+        float * w_arg = w_f32.get();
+        float * vn_arg = v_new_f32.get();
         float * gc_arg = g_cum.get();
-        half * h_arg = h_h.get();
+        float * h_arg = h_f32.get();
         const float * h0_arg = initial_state;
         float * ht_arg = final_state;
         void * args[] = {
@@ -243,25 +220,23 @@ static bool try_launch_gdn_chunk_gfx908(
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("h", modules.functions[GDN_CHUNK_H],
-            4, 48, 1, 128, 8192, stream, args);
+            4, 48, 1, 128, 16384, stream, args);
     }
     {
-        half * q_arg = q_h.get();
-        half * k_arg = k_h.get();
-        half * vn_arg = v_new_h.get();
-        half * h_arg = h_h.get();
+        const float * q_arg = q;
+        const float * k_arg = k;
+        float * vn_arg = v_new_f32.get();
+        float * h_arg = h_f32.get();
         float * gc_arg = g_cum.get();
-        half * out_arg = out_h.get();
+        float * out_arg = dst;
         void * args[] = {
             &q_arg, &k_arg, &vn_arg, &h_arg, &gc_arg, &out_arg, &scale, (void *) &T,
             &global_scratch, &profile_scratch
         };
         gdn_chunk_launch_module("o", modules.functions[GDN_CHUNK_O],
-            1, NT, 48, 512, 32768, stream, args);
+            1, NT, 48, 512, 65536, stream, args);
     }
 
-    gdn_chunk_convert_f16<<<(vh_count + convert_threads - 1) / convert_threads, convert_threads, 0, stream>>>(
-        out_h.get(), dst, vh_count);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
