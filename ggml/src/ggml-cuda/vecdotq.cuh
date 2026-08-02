@@ -28,6 +28,29 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// gfx908 MMVQ streams each weight row once while repeatedly consuming a small
+// q8 activation.  Bypass both caches for the dominant packed-weight payload so
+// that the stream does not displace the hot activation.  Keep metadata and q8
+// loads temporal; this helper is deliberately used only at weight call sites.
+static __device__ __forceinline__ int get_int_b2_weight(const void * x, const int & i32) {
+#if defined(CDNA1) && defined(GGML_HIP_MMVQ_NT_WEIGHTS)
+    const uint16_t * x16 = (const uint16_t *) x;
+    const int lo = __builtin_nontemporal_load(x16 + 2*i32 + 0);
+    const int hi = __builtin_nontemporal_load(x16 + 2*i32 + 1);
+    return lo | (hi << 16);
+#else
+    return get_int_b2(x, i32);
+#endif
+}
+
+static __device__ __forceinline__ int get_int_b4_weight(const void * x, const int & i32) {
+#if defined(CDNA1) && defined(GGML_HIP_MMVQ_NT_WEIGHTS)
+    return __builtin_nontemporal_load(((const int *) x) + i32);
+#else
+    return get_int_b4(x, i32);
+#endif
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
@@ -936,8 +959,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     // iqs = 12..15 -> bq8_offset = 6, want q4_offset = 96, 100, 104, 108
 
     const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    v[0] = q4[0];
-    v[1] = q4[4];
+    v[0] = get_int_b4_weight(q4, 0);
+    v[1] = get_int_b4_weight(q4, 4);
 
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
@@ -992,8 +1015,8 @@ static __device__ __forceinline__ void vec_dot_q4_K_q8_1_m2(
 
     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
     const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    const int v0 = q4[0];
-    const int v1 = q4[4];
+    const int v0 = get_int_b4_weight(q4, 0);
+    const int v1 = get_int_b4_weight(q4, 4);
 
     const uint16_t * scales = (const uint16_t *) bq4_K->scales;
     uint16_t aux[2];
@@ -1117,8 +1140,8 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    const int vl = get_int_b2_weight(bq6_K->ql, iqs);
+    const int vh = get_int_b2_weight(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
 
     const int8_t * scales = bq6_K->scales + scale_offset;
 
@@ -1146,8 +1169,8 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_m2(
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
 
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    const int vl = get_int_b2_weight(bq6_K->ql, iqs);
+    const int vh = get_int_b2_weight(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
     const int8_t * scales = bq6_K->scales + scale_offset;
 
     float sumf_0 = 0.0f;
@@ -1486,7 +1509,7 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+        const int aux_q4 = get_int_b2_weight(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
@@ -1511,7 +1534,7 @@ static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_m2(
     int sumi_1 = 0;
 #pragma unroll
     for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
-        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+        const int aux_q4 = get_int_b2_weight(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         sumi_0 = ggml_cuda_dp4a(v.x, q8_0[l + 0], sumi_0);
