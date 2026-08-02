@@ -75,7 +75,7 @@ static __global__ void flash_attn_ext_vec(
 #ifdef RDNA
     constexpr int nthreads_KQ_q = 2;
 #elif defined(CDNA1)
-    constexpr int nthreads_KQ_q = 8;
+    constexpr int nthreads_KQ_q = 32;
 #else
     constexpr int nthreads_KQ_q = 4;
 #endif
