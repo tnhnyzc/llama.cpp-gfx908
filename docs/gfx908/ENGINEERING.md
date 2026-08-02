@@ -88,7 +88,9 @@ why the current branch contains regression oracles and conservative guards.
 - Projection-split wave ownership is rejected at -0.91% end to end. Direct
   unaligned dword source loads are neutral (+0.06%) because the baseline compiler
   already emits dword loads. Cooperative metadata shuffles regress approximately
-  37.5%; gfx908 shuffle/control cost exceeds any saved replicated requests.
+  37.5%; gfx908 shuffle/control cost exceeds any saved replicated requests. A
+  CDNA1 two-iteration outer-K-loop unroll is also neutral/slightly negative at
+  -0.21% end to end; compiler loop hints do not expose the missing MLP.
 - Roughly 1,780 dispatches per representative token make launch and graph gaps
   relevant, but removing them is mostly an upstream graph/fusion problem rather
   than a simple gfx908 kernel switch.
