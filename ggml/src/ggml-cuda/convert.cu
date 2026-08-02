@@ -284,6 +284,31 @@ static __global__ void dequantize_block_iq4_nl_w64(const void * __restrict__ vx,
     dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x & 31);
 }
 
+// Coalesced-store variant. The stock mapping is il = tid/8, ib = tid%8 with the
+// output at 32*ib + 4*il, so consecutive lanes write 64 B apart -- the stores
+// scatter. Swapping the derivation (il = tid%4, ib = tid/4) is a pure permutation
+// of work across threads: the same 256 values are produced, but lanes 0-3 now
+// write 32 contiguous bytes and reads fall inside one block.
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_nl_w64c(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                    const int64_t nb) {
+    const int64_t i = (int64_t) blockIdx.x*2 + (threadIdx.x >> 5);
+    if (i >= nb) {
+        return;
+    }
+    const int tid = threadIdx.x & 31;
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + i*(QK_K/QK4_NL);
+    const int64_t il = tid % 4;     // 0..3   (was tid/8)
+    const int64_t ib = tid / 4;     // 0..7   (was tid%8)
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t * q4 = x[ib].qs + 4*il;
+    const float d = (float) x[ib].d;
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
+        y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+    }
+}
+
 // Every one of these kernels has the identical shape
 //     i = blockIdx.x;  dequantize_X(vx, i, yy + i*QK_K, threadIdx.x);
 // with a 32-thread launch, so one macro covers them all.
@@ -474,7 +499,15 @@ static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t
     const int nb = (k + QK_K - 1) / QK_K;
 #if defined(GGML_USE_HIP)
     if (ggml_cuda_dequant_wave64()) {
-        dequantize_block_iq4_nl_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        static const bool coalesced = [] {
+            const char * e = getenv("GGML_HIP_DEQUANT_COALESCE");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        if (coalesced) {
+            dequantize_block_iq4_nl_w64c<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        } else {
+            dequantize_block_iq4_nl_w64<<<(nb + 1)/2, 64, 0, stream>>>(vx, y, nb);
+        }
         return;
     }
 #endif
