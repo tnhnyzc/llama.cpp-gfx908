@@ -9713,7 +9713,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // so the batch-1 path that dominates token generation was never measured
     // here. These are the four real per-layer tensors of Qwen3.6-27B.
     for (ggml_type type_a : {GGML_TYPE_IQ4_NL}) {
-        for (int n : {1, 2}) {
+        for (int n : {1, 2, 3, 4}) {
             test_cases.emplace_back(new test_mul_mat(   // ffn_gate / ffn_up
                 type_a, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(   // ffn_down
