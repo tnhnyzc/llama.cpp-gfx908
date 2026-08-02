@@ -92,6 +92,15 @@ why the current branch contains regression oracles and conservative guards.
 - Roughly 1,780 dispatches per representative token make launch and graph gaps
   relevant, but removing them is mostly an upstream graph/fusion problem rather
   than a simple gfx908 kernel switch.
+- Standalone adjacent Q8_1 activation reuse is measured and parked. Qwen3.6-27B
+  Q6_K has 80 reusable sibling quantizations among 337 MMVQ calls per decode
+  evaluation (23.74%). A graph-disabled prototype removes exactly those 80
+  launches and cuts `quantize_q8_1` time 23.57%, but this is only 0.95% of
+  summed kernel time. End-to-end brackets disagreed (+0.50% short, -0.56%
+  sustained under strong clock drift), so no TG gain is claimed. A graph-safe
+  cache is not justified unless incorporated into broader persistent/fused
+  execution that also removes inter-kernel gaps. Artifact:
+  `results/claude-tg-20260802/q8-reuse/FINDINGS.md` on the experiment host.
 - Long-context quantized attention had a separate wave64 subgroup gap and now
   gains approximately 2-4% whole-model TG at the measured depths.
 
@@ -113,8 +122,9 @@ why the current branch contains regression oracles and conservative guards.
 5. Package the chunked GDN source/assets reproducibly.
 6. Compare CUDA and HIP with the same model, depth, speculation and profiler
    correction to isolate launch latency and memory-level parallelism.
-7. Build a minimal persistent/shared-activation experiment only if dispatch
-   traces confirm repeated identical activation quantization can be reused.
+7. Do not pursue standalone adjacent activation caching further: its measured
+   whole-kernel ceiling is about 1%. Revisit shared activations only inside a
+   persistent/fused projection design that removes larger launch/gap costs too.
 8. Continue the fused FP16-MFMA path by transplanting the block-owned quant
    decoder into a selected exact-shape Tensile-class schedule.
 9. Treat Vulkan as a later independent backend port using HIP as the oracle,
