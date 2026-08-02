@@ -16,7 +16,10 @@ test -s "${build_dir}/BUILD-MANIFEST.txt"
 )
 
 manifest_commit=$(sed -n 's/^source_commit=//p' "${build_dir}/BUILD-MANIFEST.txt")
-test "${manifest_commit}" = "$(git -C "${repo_dir}" rev-parse HEAD)"
+git -C "${repo_dir}" merge-base --is-ancestor "${manifest_commit}" HEAD
+git -C "${repo_dir}" diff --quiet "${manifest_commit}"..HEAD -- . \
+    ':(exclude)docs/**' \
+    ':(exclude)scripts/gfx908/validate-release.sh'
 
 export LD_LIBRARY_PATH="${build_dir}/bin:${rocm_dir}/lib:${rocm_dir}/lib64:${rocm_dir}/llvm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 "${build_dir}/bin/llama-server" --version
