@@ -9677,6 +9677,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_IQ4_NL, GGML_GLU_OP_SWIGLU, 2, 5120, 17408,
         false, 1, 1, false, false, true, false, {1, 1}));
 
+    // Production Qwen3.6 Q6_K N=1 gate/up fusion shapes on gfx908.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 1, 17408, 5120,
+        false, 1, 1, false, false, true, false, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, 1, 5120, 17408,
+        false, 1, 1, false, false, true, false, {1, 1}));
+
     // Production Qwen3.6 ordinary N=1 MMVQ shapes on gfx908.
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1}));

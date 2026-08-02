@@ -640,9 +640,18 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
+#if defined(CDNA1)
+        // q6 = qu - 32. Apply the zero-point correction after the dot
+        // product and avoid the costly packed saturating byte subtract on
+        // gfx908. A second dot4 computes the exact local q8 sum.
+        const int vi = vil | vih;
+        const int dot_u = ggml_cuda_dp4a(vi, u[i], 0);
+        const int sum_u = ggml_cuda_dp4a(0x01010101, u[i], 0);
+        sumf += d8[i] * ((dot_u - 32*sum_u) * sc);
+#else
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
-
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+#endif
     }
 
     return d*sumf;
@@ -1147,7 +1156,9 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_m2(
     for (int i = 0; i < QR6_K; ++i) {
         const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+#if !defined(CDNA1)
         const int vi = __vsubss4((vil | vih), 0x20202020);
+#endif
 
         const block_q8_1 * bq8i_0 = bq8_1_0 + bq8_offset + 2*i;
         const block_q8_1 * bq8i_1 = bq8_1_1 + bq8_offset + 2*i;
@@ -1155,8 +1166,17 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_m2(
         const int u_1 = get_int_b4(bq8i_1->qs, iqs % QI8_1);
         const int sc = scales[4*i];
 
+#if defined(CDNA1)
+        const int dot_u_0 = ggml_cuda_dp4a(vil | vih, u_0, 0);
+        const int dot_u_1 = ggml_cuda_dp4a(vil | vih, u_1, 0);
+        const int sum_u_0 = ggml_cuda_dp4a(0x01010101, u_0, 0);
+        const int sum_u_1 = ggml_cuda_dp4a(0x01010101, u_1, 0);
+        sumf_0 += __low2float(bq8i_0->ds) * ((dot_u_0 - 32*sum_u_0) * sc);
+        sumf_1 += __low2float(bq8i_1->ds) * ((dot_u_1 - 32*sum_u_1) * sc);
+#else
         sumf_0 += __low2float(bq8i_0->ds) * (ggml_cuda_dp4a(vi, u_0, 0) * sc);
         sumf_1 += __low2float(bq8i_1->ds) * (ggml_cuda_dp4a(vi, u_1, 0) * sc);
+#endif
     }
 
     const float d = bq6_K->d;
