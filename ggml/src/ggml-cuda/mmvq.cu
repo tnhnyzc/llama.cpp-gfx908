@@ -371,7 +371,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             case 2:
             case 3:
             case 4:
-                return 2;
+                return 3;
             case 5:
             case 6:
             case 7:
