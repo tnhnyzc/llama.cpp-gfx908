@@ -300,6 +300,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         if (GGML_CUDA_CC_IS_CDNA3(cc)) {
             return true;
         }
+        // On CDNA1/gfx908, IQ4_NL MMQ is faster than dequantize + rocBLAS
+        // through M=320. The advantage is gone by M=352 on MI100 with
+        // ROCm 7.15; keep this restricted to CDNA1 and IQ4_NL.
+        if (GGML_CUDA_CC_IS_CDNA1(cc) && type == GGML_TYPE_IQ4_NL && ne11 <= 320) {
+            return true;
+        }
         if (n_experts > 64 || ne11 <= 128) {
             return true;
         }
