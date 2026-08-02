@@ -58,6 +58,17 @@ into, and what should not be mistaken for a production result.
 - Broad compiler flags, XNACK targeting, larger MMVQ wave counts, and the tested
   manual software-prefetch variants were neutral or negative.
 
+## Deployment layout
+
+- `/home/llm/mi100/llama.cpp-gfx908` is the only production source tree.
+- `/home/llm/mi100/llama.cpp-gfx908/build-prod` is the only production HIP
+  build.
+- `/home/llm/mi100/llama.cpp-gfx908-current` is the atomic deployment symlink.
+- GDN HSACO files live inside `build-prod/runtime/gdn` and are verified against
+  `scripts/gfx908/gdn-sha256.txt`.
+- Experimental branches remain in Git; they do not require persistent
+  worktrees or build products.
+
 ## Open portability work
 
 - Package the chunked GDN kernel source and reproducible HSACO build process.

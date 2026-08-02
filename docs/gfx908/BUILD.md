@@ -1,5 +1,23 @@
 # Building for gfx908
 
+## Canonical release build
+
+The daily MI100 deployment is built from this repository with one command:
+
+```sh
+scripts/gfx908/build-release.sh
+```
+
+The canonical output is `build-prod`. It contains the server, CLI, benchmark
+and backend-test binaries, the exact GDN HSACO files used at runtime, and a
+`BUILD-MANIFEST.txt` recording the source commit, ROCm prefix and binary
+hashes. `scripts/gfx908/validate-release.sh` rejects an incomplete or stale
+release before deployment.
+
+llama-swap should reference only the stable `llama.cpp-gfx908-current` symlink
+and `build-prod`; experimental worktrees and build directories are never
+production dependencies.
+
 ## Tested configuration
 
 The qualified build used Ubuntu in a Proxmox VM with the MI100 passed through,
@@ -27,14 +45,16 @@ device as CDNA1/gfx908 and report HIP flash attention and MMQ MFMA support.
 ## Optional recurrent prefill kernels
 
 The chunked GDN path dynamically loads five precompiled gfx908 HSACO files. The
-binaries are not yet shipped in this repository because their source and
-license/provenance need to be packaged cleanly first.
+public repository records their qualified hashes but does not publish the
+binaries while their source and license/provenance are being packaged. The
+release script verifies the local qualified set and copies it into
+`build-prod/runtime/gdn`, making the deployed build self-contained.
 
 Set both variables when using that path:
 
 ```sh
 export GGML_HIP_GDN_CHUNK_GFX908=1
-export GGML_HIP_GDN_CHUNK_GFX908_DIR=/absolute/path/to/gfx908-gdn-hsacos
+export GGML_HIP_GDN_CHUNK_GFX908_DIR=/path/to/llama.cpp-gfx908-current/build-prod/runtime/gdn
 ```
 
 Without `GGML_HIP_GDN_CHUNK_GFX908=1`, the normal llama.cpp recurrence remains
