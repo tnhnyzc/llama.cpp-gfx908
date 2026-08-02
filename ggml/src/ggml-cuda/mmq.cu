@@ -300,6 +300,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         if (GGML_CUDA_CC_IS_CDNA3(cc)) {
             return true;
         }
+        // Experimental gfx908-only route used to evaluate larger IQ4_NL MMQ
+        // column tiles. Production routing remains unchanged in the baseline
+        // build and this source tree is never used by llama-swap.
+        if (GGML_CUDA_CC_IS_CDNA1(cc) && type == GGML_TYPE_IQ4_NL && ne11 <= 512) {
+            return true;
+        }
         if (n_experts > 64 || ne11 <= 128) {
             return true;
         }
