@@ -1399,6 +1399,55 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     return d * sumi;
 }
 
+// Multi-column IQ4_NL dot: load and unpack each weight block ONCE, then dot it
+// against all N activation columns.
+//
+// The generic mul_mat_vec_q loop calls vec_dot_q_cuda once per column on the
+// same weight block, so at ncols_dst=3 the same 4-bit block is re-read and
+// re-unpacked three times. Per 16 bytes per row that is 3*(24 perm + 8 dp4a)
+// = 96 ALU ops, where sharing the unpack gives 24 perm + 24 dp4a = 48.
+//
+// This matters only because the kernel changes regime with ncols_dst: measured
+// on gfx908, n=1 runs at 820 GB/s (97% of the achievable 848, memory-bound)
+// while n=3 has 3x the ops but only 1.56x the time -- i.e. ALU has become the
+// constraint. Halving the op count should return it to memory-bound.
+template <int N>
+static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_mN(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ y0,
+    const int stride_col_y, const int & kbx, const int & iqs, float (&result)[N]) {
+
+    const block_iq4_nl * bq4 = (const block_iq4_nl *) vbq + kbx;
+
+    const int * q8[N];
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+        q8[c] = (const int *) (y0 + c*stride_col_y)->qs + iqs;
+    }
+
+    int sumi[N];
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+        sumi[c] = 0;
+    }
+
+#pragma unroll
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);   // once for all N columns
+#pragma unroll
+        for (int c = 0; c < N; ++c) {
+            sumi[c] = ggml_cuda_dp4a(v.x, q8[c][l + 0], sumi[c]);
+            sumi[c] = ggml_cuda_dp4a(v.y, q8[c][l + 4], sumi[c]);
+        }
+    }
+
+    const float d = __half2float(bq4->d);
+#pragma unroll
+    for (int c = 0; c < N; ++c) {
+        result[c] = d * __low2float((y0 + c*stride_col_y)->ds) * sumi[c];
+    }
+}
+
 static __device__ __forceinline__ void vec_dot_iq4_nl_q8_1_m2(
     const void * __restrict__ vbq,
     const block_q8_1 * __restrict__ bq8_1_0,

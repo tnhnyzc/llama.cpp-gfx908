@@ -9709,6 +9709,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Decode shapes. The perf list starts at n=384, so the speculative-decode
+    // path (n=3 under --spec-draft-n-max 2) was never measured here.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL}) {
+        for (int n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, n, 5120,  {1,1}, {1,1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120,  n, 17408, {1,1}, {1,1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 5120,  n, 5120,  {1,1}, {1,1}));
+        }
+    }
+
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
     uint32_t                        kwh_idx  = 1;

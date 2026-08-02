@@ -644,6 +644,33 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+        } else if constexpr (type == GGML_TYPE_IQ4_NL && ncols_dst >= 3 && ncols_dst <= 4) {
+            // Production decode with speculation runs ncols_dst=3 (n_max=2 -> 2
+            // draft + 1). The generic path below re-unpacks the same weight
+            // block once per column; share it instead. See vec_dot_iq4_nl_q8_1_mN.
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_iq4_nl_q8_1_mN<ncols_dst>(
+                    vx, &y[kby], stride_col_y,
+                    kbx_offset + i*stride_row_x + kbx, kqs, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        float dots_gate[ncols_dst];
+                        vec_dot_iq4_nl_q8_1_mN<ncols_dst>(
+                            vgate, &y[kby], stride_col_y,
+                            kbx_offset + i*stride_row_x + kbx, kqs, dots_gate);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += dots_gate[j];
+                        }
+                    }
+                }
+            }
         } else if constexpr (type == GGML_TYPE_Q6_K && ncols_dst == 2) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
