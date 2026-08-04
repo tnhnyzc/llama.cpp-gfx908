@@ -5,6 +5,7 @@
 #ifndef NOMINMAX
 #   define NOMINMAX
 #endif
+#include <malloc.h>
 #include <windows.h>
 #endif
 
@@ -775,12 +776,23 @@ struct ggml_backend_sched_copy_profile {
     uint64_t copies;
     uint64_t bytes;
     uint64_t async_copies;
+    uint64_t staged_copies;
     uint64_t fallback_copies;
     uint64_t immediate_copies;
     int64_t  dst_wait_us;
     int64_t  src_sync_us;
     int64_t  dst_sync_us;
     int64_t  blocking_copy_us;
+};
+
+struct ggml_backend_sched_staging {
+    void * producer;
+    void * consumer;
+    size_t capacity;
+    ggml_backend_unregister_host_buffer_v2_t producer_unregister;
+    ggml_backend_unregister_host_buffer_v2_t consumer_unregister;
+    bool producer_registered;
+    bool consumer_registered;
 };
 
 struct ggml_backend_sched {
@@ -844,6 +856,12 @@ struct ggml_backend_sched {
     uint64_t copy_profile_graphs;
     uint64_t copy_profile_splits;
     struct ggml_backend_sched_copy_profile copy_profile[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS];
+
+    // Experimental transaction-oriented transport for independently loaded
+    // accelerator runtimes. Disabled unless GGML_SCHED_HETERO_STAGING is set.
+    bool heterogeneous_staging;
+    bool staging_supported[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS];
+    struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -859,6 +877,115 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
         }
     }
     return -1;
+}
+
+static void * ggml_backend_sched_staging_alloc(size_t alignment, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, alignment);
+#else
+    return aligned_alloc(alignment, size);
+#endif
+}
+
+static void ggml_backend_sched_staging_free(void * ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static void ggml_backend_sched_staging_release(struct ggml_backend_sched_staging * staging) {
+    if (staging->consumer_registered && staging->consumer_unregister) {
+        staging->consumer_unregister(staging->consumer);
+    }
+    if (staging->producer_registered && staging->producer_unregister) {
+        staging->producer_unregister(staging->producer);
+    }
+    ggml_backend_sched_staging_free(staging->consumer);
+    ggml_backend_sched_staging_free(staging->producer);
+    *staging = {};
+}
+
+static bool ggml_backend_sched_staging_supported(
+        ggml_backend_sched_t sched,
+        int producer_id,
+        int consumer_id) {
+    if (producer_id < 0 || consumer_id < 0 || producer_id == consumer_id) {
+        return false;
+    }
+
+    ggml_backend_reg_t producer_reg = ggml_backend_dev_backend_reg(
+        ggml_backend_get_device(sched->backends[producer_id]));
+    ggml_backend_reg_t consumer_reg = ggml_backend_dev_backend_reg(
+        ggml_backend_get_device(sched->backends[consumer_id]));
+    if (producer_reg == consumer_reg) {
+        return false;
+    }
+
+    return ggml_backend_reg_get_proc_address(producer_reg, "ggml_backend_register_host_buffer_v2") &&
+           ggml_backend_reg_get_proc_address(producer_reg, "ggml_backend_unregister_host_buffer_v2") &&
+           ggml_backend_reg_get_proc_address(consumer_reg, "ggml_backend_register_host_buffer_v2") &&
+           ggml_backend_reg_get_proc_address(consumer_reg, "ggml_backend_unregister_host_buffer_v2");
+}
+
+static bool ggml_backend_sched_staging_reserve(
+        ggml_backend_sched_t sched,
+        int producer_id,
+        int consumer_id,
+        int copy_id,
+        size_t required) {
+    struct ggml_backend_sched_staging * staging = &sched->staging[producer_id][consumer_id][copy_id];
+    if (staging->capacity >= required) {
+        return true;
+    }
+
+    // A growth is rare after graph warm-up. Synchronize before unregistering a
+    // range that may still be referenced by either runtime.
+    if (staging->capacity != 0) {
+        ggml_backend_synchronize(sched->backends[producer_id]);
+        ggml_backend_synchronize(sched->backends[consumer_id]);
+        ggml_backend_sched_staging_release(staging);
+    }
+
+    ggml_backend_reg_t producer_reg = ggml_backend_dev_backend_reg(
+        ggml_backend_get_device(sched->backends[producer_id]));
+    ggml_backend_reg_t consumer_reg = ggml_backend_dev_backend_reg(
+        ggml_backend_get_device(sched->backends[consumer_id]));
+
+    auto producer_register = (ggml_backend_register_host_buffer_v2_t)
+        ggml_backend_reg_get_proc_address(producer_reg, "ggml_backend_register_host_buffer_v2");
+    auto consumer_register = (ggml_backend_register_host_buffer_v2_t)
+        ggml_backend_reg_get_proc_address(consumer_reg, "ggml_backend_register_host_buffer_v2");
+    staging->producer_unregister = (ggml_backend_unregister_host_buffer_v2_t)
+        ggml_backend_reg_get_proc_address(producer_reg, "ggml_backend_unregister_host_buffer_v2");
+    staging->consumer_unregister = (ggml_backend_unregister_host_buffer_v2_t)
+        ggml_backend_reg_get_proc_address(consumer_reg, "ggml_backend_unregister_host_buffer_v2");
+
+    if (!producer_register || !consumer_register ||
+        !staging->producer_unregister || !staging->consumer_unregister) {
+        *staging = {};
+        return false;
+    }
+
+    const size_t alignment = 4096;
+    const size_t capacity = (required + alignment - 1) / alignment * alignment;
+    staging->producer = ggml_backend_sched_staging_alloc(alignment, capacity);
+    staging->consumer = ggml_backend_sched_staging_alloc(alignment, capacity);
+    if (!staging->producer || !staging->consumer) {
+        ggml_backend_sched_staging_release(staging);
+        return false;
+    }
+
+    staging->producer_registered = producer_register(staging->producer, capacity, 0);
+    staging->consumer_registered = consumer_register(staging->consumer, capacity, 0);
+    if (!staging->producer_registered || !staging->consumer_registered) {
+        ggml_backend_sched_staging_release(staging);
+        return false;
+    }
+
+    staging->capacity = capacity;
+    return true;
 }
 
 static void ggml_backend_sched_copy_profile_report(ggml_backend_sched_t sched) {
@@ -879,13 +1006,14 @@ static void ggml_backend_sched_copy_profile_report(ggml_backend_sched_t sched) {
             }
 
             GGML_LOG_INFO(
-                "sched-copy: %s -> %s copies=%llu bytes=%llu async=%llu fallback=%llu immediate=%llu "
+                "sched-copy: %s -> %s copies=%llu bytes=%llu async=%llu staged=%llu fallback=%llu immediate=%llu "
                 "dst_wait_us=%lld src_sync_us=%lld dst_sync_us=%lld blocking_copy_us=%lld\n",
                 ggml_backend_name(sched->backends[src]),
                 ggml_backend_name(sched->backends[dst]),
                 (unsigned long long) p->copies,
                 (unsigned long long) p->bytes,
                 (unsigned long long) p->async_copies,
+                (unsigned long long) p->staged_copies,
                 (unsigned long long) p->fallback_copies,
                 (unsigned long long) p->immediate_copies,
                 (long long) p->dst_wait_us,
@@ -1618,10 +1746,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    struct staged_copy {
+        int producer_id;
+        struct ggml_tensor * src;
+        struct ggml_tensor * dst;
+        size_t size;
+        size_t offset;
+        struct ggml_backend_sched_copy_profile * profile;
+    };
+    std::vector<staged_copy> staged_copies;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        staged_copies.clear();
+
+        // The transaction path reuses the destination copy slot once per
+        // split, rather than once per input tensor. This must be a host-side
+        // wait: the CPU is about to overwrite staging memory that may still be
+        // referenced by the previous H2D transfer.
+        bool destination_reuse_waited = false;
+        bool has_heterogeneous_candidate = false;
+        if (sched->heterogeneous_staging) {
+            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+                const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+                if (input_backend_id >= 0 && sched->staging_supported[input_backend_id][split_backend_id]) {
+                    has_heterogeneous_candidate = true;
+                    break;
+                }
+            }
+        }
+        if (has_heterogeneous_candidate) {
+            struct ggml_backend_sched_copy_profile * wait_profile = nullptr;
+            for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+                struct ggml_tensor * input = split->inputs[input_id];
+                if (!wait_profile && sched->copy_profile_interval > 0) {
+                    ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+                    const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+                    if (input_backend_id >= 0) {
+                        wait_profile = &sched->copy_profile[input_backend_id][split_backend_id];
+                    }
+                }
+            }
+
+            const int64_t wait_start_us = wait_profile ? ggml_time_us() : 0;
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            if (wait_profile) {
+                wait_profile->dst_wait_us += ggml_time_us() - wait_start_us;
+            }
+            destination_reuse_waited = true;
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1639,15 +1819,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                const int64_t wait_start_us = copy_profile ? ggml_time_us() : 0;
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
-                }
+                if (!destination_reuse_waited) {
+                    const int64_t wait_start_us = copy_profile ? ggml_time_us() : 0;
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
 
-                if (copy_profile) {
-                    copy_profile->dst_wait_us += ggml_time_us() - wait_start_us;
+                    if (copy_profile) {
+                        copy_profile->dst_wait_us += ggml_time_us() - wait_start_us;
+                    }
                 }
 
                 const int64_t copy_start_us = copy_profile ? ggml_time_us() : 0;
@@ -1658,15 +1840,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
-                const int64_t wait_start_us = copy_profile ? ggml_time_us() : 0;
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
-                }
+                if (!destination_reuse_waited) {
+                    const int64_t wait_start_us = copy_profile ? ggml_time_us() : 0;
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
 
-                if (copy_profile) {
-                    copy_profile->dst_wait_us += ggml_time_us() - wait_start_us;
+                    if (copy_profile) {
+                        copy_profile->dst_wait_us += ggml_time_us() - wait_start_us;
+                    }
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1761,6 +1945,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (copy_profile) {
                             copy_profile->async_copies++;
                         }
+                    } else if (sched->heterogeneous_staging && input_backend_id >= 0 && input_backend_id != split_backend_id) {
+                        staged_copies.push_back({
+                            input_backend_id,
+                            input,
+                            input_cpy,
+                            ggml_nbytes(input),
+                            0,
+                            copy_profile,
+                        });
                     } else {
                         const int64_t src_sync_start_us = copy_profile ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
@@ -1787,6 +1980,82 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
                 }
+            }
+        }
+
+        // Execute each producer-to-consumer boundary as one transaction. D2H
+        // copies share one producer synchronization, then packed host data is
+        // uploaded on the consumer stream before the split graph is enqueued.
+        for (int producer_id = 0; producer_id < sched->n_backends; ++producer_id) {
+            size_t required = 0;
+            int n_group_copies = 0;
+            struct ggml_backend_sched_copy_profile * group_profile = nullptr;
+            for (staged_copy & copy : staged_copies) {
+                if (copy.producer_id != producer_id) {
+                    continue;
+                }
+                required = (required + 255) & ~(size_t) 255;
+                copy.offset = required;
+                required += copy.size;
+                n_group_copies++;
+                group_profile = copy.profile;
+            }
+            if (n_group_copies == 0) {
+                continue;
+            }
+
+            const int64_t transaction_start_us = group_profile ? ggml_time_us() : 0;
+            if (ggml_backend_sched_staging_reserve(
+                    sched, producer_id, split_backend_id, sched->cur_copy, required)) {
+                struct ggml_backend_sched_staging * staging =
+                    &sched->staging[producer_id][split_backend_id][sched->cur_copy];
+                ggml_backend_t producer_backend = sched->backends[producer_id];
+
+                for (const staged_copy & copy : staged_copies) {
+                    if (copy.producer_id == producer_id) {
+                        ggml_backend_tensor_get_async(producer_backend, copy.src,
+                            (uint8_t *) staging->producer + copy.offset, 0, copy.size);
+                    }
+                }
+
+                const int64_t src_sync_start_us = group_profile ? ggml_time_us() : 0;
+                ggml_backend_synchronize(producer_backend);
+                if (group_profile) {
+                    group_profile->src_sync_us += ggml_time_us() - src_sync_start_us;
+                }
+
+                for (const staged_copy & copy : staged_copies) {
+                    if (copy.producer_id == producer_id) {
+                        memcpy((uint8_t *) staging->consumer + copy.offset,
+                               (uint8_t *) staging->producer + copy.offset,
+                               copy.size);
+                    }
+                }
+                for (const staged_copy & copy : staged_copies) {
+                    if (copy.producer_id == producer_id) {
+                        ggml_backend_tensor_set_async(split_backend, copy.dst,
+                            (uint8_t *) staging->consumer + copy.offset, 0, copy.size);
+                        if (copy.profile) {
+                            copy.profile->staged_copies++;
+                        }
+                    }
+                }
+            } else {
+                // A backend without writable host registration retains the
+                // existing correctness-first blocking fallback.
+                ggml_backend_synchronize(sched->backends[producer_id]);
+                ggml_backend_synchronize(split_backend);
+                for (const staged_copy & copy : staged_copies) {
+                    if (copy.producer_id == producer_id) {
+                        ggml_backend_tensor_copy(copy.src, copy.dst);
+                        if (copy.profile) {
+                            copy.profile->fallback_copies++;
+                        }
+                    }
+                }
+            }
+            if (group_profile) {
+                group_profile->blocking_copy_us += ggml_time_us() - transaction_start_us;
             }
         }
 
@@ -1866,6 +2135,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->copy_profile_interval);
     }
 
+    const char * GGML_SCHED_HETERO_STAGING = getenv("GGML_SCHED_HETERO_STAGING");
+    sched->heterogeneous_staging = GGML_SCHED_HETERO_STAGING && atoi(GGML_SCHED_HETERO_STAGING) > 0;
+    if (sched->heterogeneous_staging) {
+        GGML_LOG_INFO("sched-copy: heterogeneous transaction staging enabled\n");
+    }
+
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
     sched->debug_realloc = 1;
@@ -1911,6 +2186,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
+    if (sched->heterogeneous_staging) {
+        for (int src = 0; src < n_backends; ++src) {
+            for (int dst = 0; dst < n_backends; ++dst) {
+                sched->staging_supported[src][dst] = ggml_backend_sched_staging_supported(sched, src, dst);
+            }
+        }
+    }
+
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
@@ -1922,6 +2205,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->heterogeneous_staging) {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            ggml_backend_synchronize(sched->backends[b]);
+        }
+        for (int src = 0; src < sched->n_backends; ++src) {
+            for (int dst = 0; dst < sched->n_backends; ++dst) {
+                for (int copy = 0; copy < sched->n_copies; ++copy) {
+                    ggml_backend_sched_staging_release(&sched->staging[src][dst][copy]);
+                }
+            }
+        }
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {

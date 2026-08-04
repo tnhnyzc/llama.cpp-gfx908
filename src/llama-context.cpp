@@ -495,6 +495,11 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // The scheduler owns events and may own backend-registered host staging.
+    // Release it explicitly while the backend owners are still alive; member
+    // destruction order otherwise destroys `backends` before `sched`.
+    sched.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {

@@ -31,7 +31,7 @@ This is correct, but it serializes a graph boundary at tensor granularity and pr
 - Keep native same-runtime peer copies on their existing fast path.
 - Retain a correctness-first fallback when host registration or asynchronous access is unavailable.
 
-## Proposed architecture
+## Architecture
 
 ### 1. Transfer plan
 
@@ -80,6 +80,21 @@ CUDA events cannot be consumed by ROCm streams and ROCm events cannot be consume
 
 That is a second phase. First establish the batched transaction baseline. If its remaining wall-time share justifies more complexity, a worker can wait on producer completion and enqueue the consumer transfer and graph while the main scheduler advances independent work.
 
+## Implemented phase-one path
+
+`GGML_SCHED_HETERO_STAGING=1` enables the transaction path. It is opt-in while production-shaped validation is in progress. With the variable unset, scheduler behavior is unchanged.
+
+The implementation currently:
+
+- identifies boundaries between independently loaded accelerator runtimes while leaving same-runtime CUDA and HIP copies on their native path;
+- owns separate writable producer and consumer host ranges for every backend pair and pipeline copy slot;
+- grows those ranges only when the graph requires more capacity, then reuses them without per-graph allocation;
+- waits on the consumer copy-slot event on the host before overwriting staging memory, batches all producer D2H operations, synchronizes each producer once, packs the host data, and enqueues all H2D operations before consumer compute;
+- falls back to the existing blocking copy if either backend lacks writable host registration;
+- releases scheduler staging explicitly while backend registrations are still alive. This requires the llama context to destroy its scheduler before its backend owners because ordinary C++ member destruction order is the reverse.
+
+The consumer reuse wait must be a host-side event synchronization. A stream-side wait only orders future consumer stream work; it does not stop the CPU from overwriting host staging that an earlier H2D operation may still be reading.
+
 ## Measurement contract
 
 `GGML_SCHED_COPY_PROFILE=N` enables aggregate diagnostics every N graph executions without changing copy behavior. Report by backend pair:
@@ -121,6 +136,21 @@ The initial writable-registration probe passed exact-byte validation in both dir
 These are isolated transfer latencies, not model-throughput claims. They establish that reusable writable staging is valid and that its direct benefit is concentrated in small transfers; boundary batching is still required to remove repeated synchronization across a group of tensors.
 
 ### Model oracles
+
+An intentionally boundary-heavy Gemma4-31B QAT stress graph placed complete even layers on the RTX 3090 and complete odd layers on the MI100. This creates roughly 60 CUDA-to-HIP or HIP-to-CUDA graph boundaries without splitting operations inside a layer. It is a transport stress oracle, not a recommended model placement.
+
+Warm three-sample `llama-bench` runs, followed by a reversed-order control, measured:
+
+| Test | Control | Staged | Change |
+|---|---:|---:|---:|
+| PP128 | 179.99 tok/s | 187.85 tok/s | +4.36% |
+| TG64 | 19.00 tok/s | 22.21 tok/s | +16.90% |
+
+The original forward control was 180.56 tok/s PP and 19.08 tok/s TG, so the reversed control reproduced it closely. A later single-turn fence after narrowing staging detection to independently loaded runtimes measured 18.9/18.8/19.1 tok/s control and 21.3/21.4/21.6 tok/s staged, with the reversed control returning 17.9/19.0/18.8 tok/s. The exact percentage depends on the frontend and decode length, but the large transport effect is repeatable.
+
+At temperature zero, control and staged execution produced byte-identical generated text. The writable-registration probe also retained exact-byte correctness in both transfer directions.
+
+The same path was neutral on naturally split Qwen3.6-27B prompt processing and improved TG64 from 40.15 to 40.67 tok/s (+1.31%). That graph has few cross-runtime boundaries, which is the expected contrast with the stress oracle.
 
 - Step-3.7-Flash: pp128, pp512 and pp2048, plus the established real 10K prompt at the production ubatch; warm MTP decode with the existing nmax unchanged.
 - Qwen3.6-27B and GPT-OSS-120B: regression fences for the already-fast native paths.
