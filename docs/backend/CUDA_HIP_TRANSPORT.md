@@ -152,8 +152,21 @@ At temperature zero, control and staged execution produced byte-identical genera
 
 The same path was neutral on naturally split Qwen3.6-27B prompt processing and improved TG64 from 40.15 to 40.67 tok/s (+1.31%). That graph has few cross-runtime boundaries, which is the expected contrast with the stress oracle.
 
-- Step-3.7-Flash: pp128, pp512 and pp2048, plus the established real 10K prompt at the production ubatch; warm MTP decode with the existing nmax unchanged.
-- Qwen3.6-27B and GPT-OSS-120B: regression fences for the already-fast native paths.
+Step-3.7-Flash was then tested with its production model, explicit CUDA/ROCm/CPU tensor placement, 65K context configuration, Q8 KV cache, MTP plus n-gram speculation and the existing `nmax=2`. Cold decode and the first large-M prompt were discarded independently for each process. The qualified prompt contained 10,204 tokens.
+
+Two deterministic prompts were compared after warm-up and followed by a reversed control:
+
+| Oracle | Control | Staged | Change | Acceptance |
+|---|---:|---:|---:|---:|
+| C TG128 | 28.96 tok/s | 30.17 tok/s | +4.18% | 107/123 both |
+| D TG128 | 33.26 tok/s | 34.01 tok/s | +2.24% | 109/109 both |
+| C PP10204 | 193.46 tok/s | 190.49 tok/s | -1.54% | n/a |
+| D PP10204 | 191.21 tok/s | 196.17 tok/s | +2.59% | n/a |
+
+Generated output hashes matched for both control/candidate pairs. Averaged against the reversed controls, TG improved by 3.15% and PP by 0.52%; the latter is neutral within run variance. The unusually high absolute TG figures come from the deliberately repetitive oracle and its high MTP acceptance, so the production conclusion is the matched relative gain rather than a new general Step baseline.
+
+- Step-3.7-Flash: retain a later real-chat validation because the deterministic transport oracle intentionally produces unusually high speculation acceptance.
+- GPT-OSS-120B: regression fence for the already-fast mixed MoE path.
 - No DeepSeek-V4-Flash conclusions until its model support and execution path are stable.
 
 ### Acceptance
