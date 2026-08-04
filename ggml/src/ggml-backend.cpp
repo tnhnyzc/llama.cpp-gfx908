@@ -771,6 +771,18 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_copy_profile {
+    uint64_t copies;
+    uint64_t bytes;
+    uint64_t async_copies;
+    uint64_t fallback_copies;
+    uint64_t immediate_copies;
+    int64_t  dst_wait_us;
+    int64_t  src_sync_us;
+    int64_t  dst_sync_us;
+    int64_t  blocking_copy_us;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -825,6 +837,13 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // Optional aggregate diagnostics for scheduler-managed backend crossings.
+    // A positive GGML_SCHED_COPY_PROFILE value reports every N graph executions.
+    int copy_profile_interval;
+    uint64_t copy_profile_graphs;
+    uint64_t copy_profile_splits;
+    struct ggml_backend_sched_copy_profile copy_profile[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -840,6 +859,45 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
         }
     }
     return -1;
+}
+
+static void ggml_backend_sched_copy_profile_report(ggml_backend_sched_t sched) {
+    if (sched->copy_profile_interval <= 0 ||
+        sched->copy_profile_graphs % (uint64_t) sched->copy_profile_interval != 0) {
+        return;
+    }
+
+    GGML_LOG_INFO("sched-copy: graphs=%llu splits=%llu\n",
+        (unsigned long long) sched->copy_profile_graphs,
+        (unsigned long long) sched->copy_profile_splits);
+
+    for (int src = 0; src < sched->n_backends; ++src) {
+        for (int dst = 0; dst < sched->n_backends; ++dst) {
+            const struct ggml_backend_sched_copy_profile * p = &sched->copy_profile[src][dst];
+            if (p->copies == 0) {
+                continue;
+            }
+
+            GGML_LOG_INFO(
+                "sched-copy: %s -> %s copies=%llu bytes=%llu async=%llu fallback=%llu immediate=%llu "
+                "dst_wait_us=%lld src_sync_us=%lld dst_sync_us=%lld blocking_copy_us=%lld\n",
+                ggml_backend_name(sched->backends[src]),
+                ggml_backend_name(sched->backends[dst]),
+                (unsigned long long) p->copies,
+                (unsigned long long) p->bytes,
+                (unsigned long long) p->async_copies,
+                (unsigned long long) p->fallback_copies,
+                (unsigned long long) p->immediate_copies,
+                (long long) p->dst_wait_us,
+                (long long) p->src_sync_us,
+                (long long) p->dst_sync_us,
+                (long long) p->blocking_copy_us);
+        }
+    }
+
+    sched->copy_profile_graphs = 0;
+    sched->copy_profile_splits = 0;
+    memset(sched->copy_profile, 0, sizeof(sched->copy_profile));
 }
 
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
@@ -1551,6 +1609,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    if (sched->copy_profile_interval > 0) {
+        sched->copy_profile_graphs++;
+        sched->copy_profile_splits += sched->n_splits;
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1566,20 +1629,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+            struct ggml_backend_sched_copy_profile * copy_profile = nullptr;
+            if (sched->copy_profile_interval > 0 && input_backend_id >= 0) {
+                copy_profile = &sched->copy_profile[input_backend_id][split_backend_id];
+                copy_profile->copies++;
+                copy_profile->bytes += ggml_nbytes(input);
+            }
+
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                const int64_t wait_start_us = copy_profile ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+
+                if (copy_profile) {
+                    copy_profile->dst_wait_us += ggml_time_us() - wait_start_us;
+                }
+
+                const int64_t copy_start_us = copy_profile ? ggml_time_us() : 0;
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (copy_profile) {
+                    copy_profile->immediate_copies++;
+                    copy_profile->blocking_copy_us += ggml_time_us() - copy_start_us;
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                const int64_t wait_start_us = copy_profile ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+
+                if (copy_profile) {
+                    copy_profile->dst_wait_us += ggml_time_us() - wait_start_us;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1670,14 +1757,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        if (copy_profile) {
+                            copy_profile->async_copies++;
+                        }
+                    } else {
+                        const int64_t src_sync_start_us = copy_profile ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
+                        if (copy_profile) {
+                            copy_profile->src_sync_us += ggml_time_us() - src_sync_start_us;
+                        }
+
+                        const int64_t dst_sync_start_us = copy_profile ? ggml_time_us() : 0;
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+
+                        if (copy_profile) {
+                            copy_profile->dst_sync_us += ggml_time_us() - dst_sync_start_us;
+                        }
+
+                        const int64_t copy_start_us = copy_profile ? ggml_time_us() : 0;
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (copy_profile) {
+                            copy_profile->fallback_copies++;
+                            copy_profile->blocking_copy_us += ggml_time_us() - copy_start_us;
+                        }
                     }
                 }
             }
@@ -1730,6 +1837,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    ggml_backend_sched_copy_profile_report(sched);
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1748,6 +1857,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+
+    const char * GGML_SCHED_COPY_PROFILE = getenv("GGML_SCHED_COPY_PROFILE");
+    sched->copy_profile_interval = GGML_SCHED_COPY_PROFILE ? atoi(GGML_SCHED_COPY_PROFILE) : 0;
+    sched->copy_profile_interval = std::max(0, sched->copy_profile_interval);
+    if (sched->copy_profile_interval > 0) {
+        GGML_LOG_INFO("sched-copy: aggregate transfer profiling enabled (report interval: %d graph executions)\n",
+            sched->copy_profile_interval);
+    }
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
