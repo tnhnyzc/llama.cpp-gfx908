@@ -527,9 +527,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // Follow the effective layer affinity when direct tensor overrides
+            // move the attention path away from the coarse layer split.
+            ggml_backend_dev_t device_layer = model.dev_layer_affinity(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -2501,7 +2501,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
-                const auto & dev_layer = model.dev_layer(il);
+                const auto & dev_layer = model.dev_layer_affinity(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {

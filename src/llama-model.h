@@ -669,6 +669,7 @@ struct llama_model {
     void print_info() const;
 
     ggml_backend_dev_t dev_layer(int il) const;
+    ggml_backend_dev_t dev_layer_affinity(int il) const;
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
