@@ -207,6 +207,16 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Register host memory for asynchronous backend transport. Unlike legacy
+    // model-mmap registration, this capability is not controlled by an
+    // environment variable and explicitly describes whether the backend may
+    // write into the registered range.
+    enum ggml_backend_host_buffer_flags {
+        GGML_BACKEND_HOST_BUFFER_READ_ONLY = 1u << 0,
+    };
+    typedef bool (*ggml_backend_register_host_buffer_v2_t)(void * buffer, size_t size, uint32_t flags);
+    typedef void (*ggml_backend_unregister_host_buffer_v2_t)(void * buffer);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

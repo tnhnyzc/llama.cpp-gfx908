@@ -58,7 +58,17 @@ This removes repeated producer waits, repeated consumer waits and per-tensor all
 
 ### 3. Staging pool
 
-Own persistent staging allocations in the scheduler. The pool is indexed by pipeline copy slot and grows to the largest transfer plan seen for that slot. Each allocation is aligned and registered with every accelerator runtime that accesses it.
+Own persistent staging allocations in the scheduler. The pool is indexed by pipeline copy slot and grows to the largest transfer plan seen for that slot.
+
+Initial probing also showed that llama.cpp's legacy `ggml_backend_register_host_buffer` callback cannot be reused for transport. It registers mapped model weights with a read-only flag and is gated by `GGML_CUDA_REGISTER_HOST`; CUDA correctly rejects a D2H copy targeting such a range. Transport therefore needs a separate read/write registration capability with an explicit lifetime.
+
+The conservative design uses distinct runtime-owned ranges:
+
+1. producer D2H into producer-registered staging;
+2. host memcpy into consumer-registered staging;
+3. consumer H2D from consumer staging.
+
+This adds one host-memory copy but preserves explicit runtime ownership. It still removes per-tensor allocation and repeated synchronization, and the host copy can operate on packed boundary data rather than many small allocations. Sharing one writable range between both runtimes remains a possible later optimization, but it must be validated explicitly rather than inferred from successful registration calls.
 
 Host registration needs a first-class backend capability with explicit register/unregister lifetime. It should not depend on the existing model-mmap registration environment variable, and transport buffers must be writable in both directions.
 
@@ -88,11 +98,27 @@ Production conclusions require warm, same-lineage A/B runs and both absolute wal
 ### Synthetic
 
 - deterministic byte-pattern copies in both CUDA-to-ROCm directions;
+- separate producer- and consumer-registered staging ranges; never assume dual registration of one range;
 - sizes from tiny activation tensors through representative prefill tensors;
 - contiguous tensors and views with offsets;
 - repeated reuse of every scheduler copy slot;
 - registration failure and pageable fallback;
 - CPU-to-GPU partial-expert uploads remain unchanged.
+
+The initial writable-registration probe passed exact-byte validation in both directions. Thirty-iteration means on the RTX 3090 and MI100 were:
+
+| Direction | Bytes | Generic fallback | Persistent staged prototype | Change |
+|---|---:|---:|---:|---:|
+| CUDA to ROCm | 4 KiB | 25.86 us | 17.91 us | -30.7% |
+| CUDA to ROCm | 64 KiB | 45.19 us | 35.96 us | -20.4% |
+| CUDA to ROCm | 1 MiB | 446.82 us | 422.34 us | -5.5% |
+| CUDA to ROCm | 4 MiB | 1568.02 us | 1572.27 us | neutral |
+| ROCm to CUDA | 4 KiB | 29.31 us | 19.06 us | -35.0% |
+| ROCm to CUDA | 64 KiB | 46.98 us | 34.77 us | -26.0% |
+| ROCm to CUDA | 1 MiB | 436.25 us | 403.88 us | -7.4% |
+| ROCm to CUDA | 4 MiB | 1553.95 us | 1546.56 us | neutral |
+
+These are isolated transfer latencies, not model-throughput claims. They establish that reusable writable staging is valid and that its direct benefit is concentrated in small transfers; boundary batching is still required to remove repeated synchronization across a group of tensors.
 
 ### Model oracles
 

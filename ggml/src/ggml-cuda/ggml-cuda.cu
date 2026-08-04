@@ -5052,6 +5052,35 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     }
 }
 
+static bool ggml_backend_cuda_register_host_buffer_v2(void * buffer, size_t size, uint32_t flags) {
+    unsigned int runtime_flags = cudaHostRegisterPortable;
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    if (flags & GGML_BACKEND_HOST_BUFFER_READ_ONLY) {
+        runtime_flags |= cudaHostRegisterReadOnly;
+    }
+#else
+    if (flags & GGML_BACKEND_HOST_BUFFER_READ_ONLY) {
+        return false;
+    }
+#endif
+
+    cudaError_t err = cudaHostRegister(buffer, size, runtime_flags);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of transport memory: %s\n", __func__,
+            size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+static void ggml_backend_cuda_unregister_host_buffer_v2(void * buffer) {
+    cudaError_t err = cudaHostUnregister(buffer);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
+}
+
 
 // backend device
 
@@ -5858,6 +5887,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_register_host_buffer_v2") == 0) {
+        return (void *)ggml_backend_cuda_register_host_buffer_v2;
+    }
+    if (strcmp(name, "ggml_backend_unregister_host_buffer_v2") == 0) {
+        return (void *)ggml_backend_cuda_unregister_host_buffer_v2;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
