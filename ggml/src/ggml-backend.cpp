@@ -857,8 +857,8 @@ struct ggml_backend_sched {
     uint64_t copy_profile_splits;
     struct ggml_backend_sched_copy_profile copy_profile[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS];
 
-    // Experimental transaction-oriented transport for independently loaded
-    // accelerator runtimes. Disabled unless GGML_SCHED_HETERO_STAGING is set.
+    // Transaction-oriented transport for independently loaded accelerator
+    // runtimes that expose writable host staging support.
     bool heterogeneous_staging;
     bool staging_supported[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS];
     struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
@@ -2135,12 +2135,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->copy_profile_interval);
     }
 
-    const char * GGML_SCHED_HETERO_STAGING = getenv("GGML_SCHED_HETERO_STAGING");
-    sched->heterogeneous_staging = GGML_SCHED_HETERO_STAGING && atoi(GGML_SCHED_HETERO_STAGING) > 0;
-    if (sched->heterogeneous_staging) {
-        GGML_LOG_INFO("sched-copy: heterogeneous transaction staging enabled\n");
-    }
-
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
     sched->debug_realloc = 1;
@@ -2186,12 +2180,16 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    if (sched->heterogeneous_staging) {
-        for (int src = 0; src < n_backends; ++src) {
-            for (int dst = 0; dst < n_backends; ++dst) {
-                sched->staging_supported[src][dst] = ggml_backend_sched_staging_supported(sched, src, dst);
+    for (int src = 0; src < n_backends; ++src) {
+        for (int dst = 0; dst < n_backends; ++dst) {
+            sched->staging_supported[src][dst] = ggml_backend_sched_staging_supported(sched, src, dst);
+            if (sched->staging_supported[src][dst]) {
+                sched->heterogeneous_staging = true;
             }
         }
+    }
+    if (sched->heterogeneous_staging) {
+        GGML_LOG_INFO("sched-copy: heterogeneous transaction staging enabled\n");
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);

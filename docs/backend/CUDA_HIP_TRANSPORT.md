@@ -82,7 +82,7 @@ That is a second phase. First establish the batched transaction baseline. If its
 
 ## Implemented phase-one path
 
-`GGML_SCHED_HETERO_STAGING=1` enables the transaction path. It is opt-in while production-shaped validation is in progress. With the variable unset, scheduler behavior is unchanged.
+The transaction path is enabled automatically when the scheduler detects a pair of independently loaded accelerator runtimes whose registries both expose writable host-staging support. There is no per-model or environment opt-in. Same-runtime CUDA/CUDA and HIP/HIP transfers keep their native paths, while CPU and unsupported backend pairs keep the existing fallback. Operational rollback is the previous production build.
 
 The implementation currently:
 
