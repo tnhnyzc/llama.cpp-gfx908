@@ -358,6 +358,18 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// Build-time sweep parameters for the gfx908 MMVQ wave count. Defaults are the
+// values already in the tree, so an unparameterised build is unchanged.
+#ifndef GFX908_NWARPS_N3
+#define GFX908_NWARPS_N3 2
+#endif
+#ifndef GFX908_NWARPS_N4
+#define GFX908_NWARPS_N4 2
+#endif
+#ifndef GFX908_NWARPS_N8
+#define GFX908_NWARPS_N8 1
+#endif
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
@@ -377,15 +389,19 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
-            case 3:
-            case 4:
                 return 2;
+            case 3:
+                return GFX908_NWARPS_N3;
             case 2:
                 return 2;
+            case 4:
+                return GFX908_NWARPS_N4;
             case 5:
             case 6:
             case 7:
+                return 1;
             case 8:
+                return GFX908_NWARPS_N8;
             default:
                 return 1;
         }
