@@ -2,6 +2,8 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -441,6 +443,21 @@ void launch_mul_mat_vec_f_cuda(
         if (niter < niter_best) {
             niter_best      = niter;
             block_size_best = block_size;
+        }
+    }
+
+    {
+        // one-line census per launch; nothing runs unless the env var is set
+        static FILE * census = []() -> FILE * {
+            const char * p = getenv("GGML_MMVF_CENSUS");
+            return p ? fopen(p, "w") : nullptr;
+        }();
+        if (census) {
+            fprintf(census, "%lld %lld %d %lld %lld %lld %lld %d\n",
+                    (long long) ncols, (long long) nrows, (int) ncols_dst,
+                    (long long) nchannels_dst, (long long) nsamples_or_ntokens,
+                    (long long) block_size_best, (long long) stride_row,
+                    (int) sizeof(T));
         }
     }
 
