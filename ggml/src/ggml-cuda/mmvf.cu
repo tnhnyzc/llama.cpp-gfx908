@@ -433,7 +433,11 @@ void launch_mul_mat_vec_f_cuda(
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
     int64_t max_block_size  = 256;
-    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+    // The 128 cap covers every pre-RDNA AMD part by cc range and was never tuned
+    // for gfx908 specifically. CDNA1 is excluded here so it can use the 256 case
+    // the switch below already provides; every other AMD part is unchanged.
+    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1
+       && ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_CDNA1) {
         max_block_size = 128;
     }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
