@@ -34,6 +34,18 @@ into, and what should not be mistaken for a production result.
 - `GGML_HIP_Q5_K_MMQ_N3_GFX908=1`: exact Q5_K speculative-width route.
 - `GGML_HIP_DISABLE_GFX908_M2_GATE_FUSION=1`: disables the IQ4_NL M=2 gate/up
   fusion when the selected workload performs better without it.
+- `GGML_HIP_RECURRENT_MMVF_PAIR_GFX908=1`: selects the qualified exact
+  48-pair recurrent MMVF execution route. The CDNA1 MMVF 256-thread selector
+  is retained in source independently.
+- `GGML_HIP_RECURRENT_NORM_SCALE_ISLAND_GFX908=1`: enables the qualified exact
+  48-group scale/q8/paired-MMVF island. It requires the recurrent pair route
+  and preserves the materialized normalized-f32 numerical boundary at its
+  consumers.
+- `GGML_HIP_SHARED_NORM_Q8_GFX908=1`: enables the strict disjoint direct
+  norm-to-q8 route for producers whose complete fanout is eligible MMVQ.
+
+The exact four-way state and its frozen Qwen3.6-27B IQ4_NL B1 measurement are
+recorded in [QUALIFIED-B1-20260810.md](QUALIFIED-B1-20260810.md).
 
 ## Measurement controls
 
