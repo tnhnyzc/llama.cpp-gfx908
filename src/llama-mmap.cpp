@@ -523,6 +523,34 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    void populate_range_reverse(size_t first, size_t last) {
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        first &= ~(page_size - 1);
+        last = std::min(size, (last + page_size - 1) & ~(page_size - 1));
+
+        // Populate surviving mmap ranges after device uploads have released the
+        // rest of the model. Work backwards in large, forward-scanned chunks so
+        // earlier transformer layers remain resident when RAM is slightly
+        // smaller than the CPU-resident weight set.
+        const size_t chunk_size = 64 * 1024 * 1024;
+        for (size_t chunk_end = last; chunk_end > first;) {
+            const size_t chunk_begin = chunk_end - first > chunk_size ? chunk_end - chunk_size : first;
+#if defined(MADV_POPULATE_READ)
+            if (madvise((uint8_t *) addr + chunk_begin, chunk_end - chunk_begin, MADV_POPULATE_READ)) {
+                LLAMA_LOG_WARN("warning: madvise(.., MADV_POPULATE_READ) failed: %s\n", strerror(errno));
+                for (size_t offset = chunk_begin; offset < chunk_end; offset += page_size) {
+                    (void) *(volatile const uint8_t *) ((const uint8_t *) addr + offset);
+                }
+            }
+#else
+            for (size_t offset = chunk_begin; offset < chunk_end; offset += page_size) {
+                (void) *(volatile const uint8_t *) ((const uint8_t *) addr + offset);
+            }
+#endif
+            chunk_end = chunk_begin;
+        }
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -582,6 +610,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void populate_range_reverse(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -611,6 +644,13 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void populate_range_reverse(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -624,6 +664,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::populate_range_reverse(size_t first, size_t last) { pimpl->populate_range_reverse(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

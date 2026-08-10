@@ -1666,12 +1666,33 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
+            size_t mapped_bytes = 0;
+            size_t file_bytes = 0;
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
+                file_bytes += mapping->size();
+                if (mmap_used.second > mmap_used.first) {
+                    mapped_bytes += mmap_used.second - mmap_used.first;
+                }
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
+                }
+            }
+
+            // Whole-file MAP_POPULATE is counterproductive when only part of a
+            // model remains on the host: device uploads can evict the mmap pages
+            // that CPU execution will need. Re-populate only the surviving host
+            // ranges once the device-only fragments have been unmapped.
+            if (mapped_bytes > 0 && mapped_bytes < file_bytes) {
+                LLAMA_LOG_INFO("%s: populating %.2f MiB of CPU-mapped model data\n",
+                        __func__, mapped_bytes / 1024.0 / 1024.0);
+                for (size_t idx = mappings.size(); idx-- > 0;) {
+                    const auto & mmap_used = mmaps_used.at(idx);
+                    if (mmap_used.second > mmap_used.first) {
+                        mappings.at(idx)->populate_range_reverse(mmap_used.first, mmap_used.second);
+                    }
                 }
             }
         }

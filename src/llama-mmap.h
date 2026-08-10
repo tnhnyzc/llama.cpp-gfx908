@@ -49,6 +49,7 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    void populate_range_reverse(size_t first, size_t last);
 
     static const bool SUPPORTED;
 
