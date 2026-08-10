@@ -1489,6 +1489,11 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_recurrent_mmvf_pair {
+    const ggml_tensor * second_weight = nullptr;
+    void * second_scratch = nullptr;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1498,6 +1503,13 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+
+    // Experimental gfx908 recurrent alpha/beta execution island. The first
+    // MMVF computes both sibling projections; the second result remains in
+    // stable backend storage until its normal graph position.
+    std::unordered_map<const ggml_tensor *, ggml_cuda_recurrent_mmvf_pair> recurrent_mmvf_pair_leaders;
+    std::unordered_map<const ggml_tensor *, void *> recurrent_mmvf_pair_followers;
+    std::unordered_map<const ggml_tensor *, void *> recurrent_mmvf_pair_scratch;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1743,4 +1755,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
