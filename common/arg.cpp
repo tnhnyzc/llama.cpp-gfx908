@@ -1085,7 +1085,7 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         ggml_backend_load_all();
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (!dev) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
             }
             devices.push_back(dev);
@@ -1103,9 +1103,7 @@ void common_print_available_devices() {
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-            devices.push_back(dev);
-        }
+        devices.push_back(dev);
     }
     printf("Available devices:\n");
 
@@ -2749,6 +2747,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
+    add_opt(common_arg(
+        {"--expert-tensor-split"}, "N0,N1,N2,...",
+        "enable expert-only tensor parallelism and assign routed MoE experts across the --device list; "
+        "the first selected device remains the primary device for the rest of the model",
+        [](common_params & params, const std::string & value) {
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ value.begin(), value.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu expert split configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                params.expert_tensor_split[i] = i < split_arg.size() ? std::stof(split_arg[i]) : 0.0f;
+            }
+        }
+    ).set_env("LLAMA_ARG_EXPERT_TENSOR_SPLIT"));
     add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),

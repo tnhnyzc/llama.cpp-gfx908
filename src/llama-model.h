@@ -631,6 +631,10 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // Optional expert-only Meta device. Ordinary layers remain on devices;
+    // only routed expert weights are allocated on this device.
+    llama_device expert_device = { false, nullptr };
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
@@ -657,6 +661,7 @@ struct llama_model {
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;
+    const float * expert_tensor_split() const;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;

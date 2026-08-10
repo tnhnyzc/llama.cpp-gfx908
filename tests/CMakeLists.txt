@@ -264,8 +264,45 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-meta-split-cache-rebuild.cpp)
+llama_build_and_test(test-meta-expert-partial-policy.cpp)
+llama_build_and_test(test-meta-host-allreduce.cpp)
+set_tests_properties(test-meta-host-allreduce PROPERTIES ENVIRONMENT "GGML_META_HOST_ALLREDUCE=1")
+
+# Contract for expert-axis tensor parallelism. Run each backend in a separate
+# process so an accelerator abort cannot mask the results from the others.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build(test-mul-mat-id-expert-shard.cpp)
+    llama_test(test-mul-mat-id-expert-shard NAME test-mul-mat-id-expert-shard-cpu   ARGS CPU)
+    llama_test(test-mul-mat-id-expert-shard NAME test-mul-mat-id-expert-shard-cuda  ARGS CUDA0)
+    llama_test(test-mul-mat-id-expert-shard NAME test-mul-mat-id-expert-shard-rocm  ARGS ROCm0)
+    set_tests_properties(
+        test-mul-mat-id-expert-shard-cpu
+        test-mul-mat-id-expert-shard-cuda
+        test-mul-mat-id-expert-shard-rocm
+        PROPERTIES SKIP_RETURN_CODE 77)
+
+    # End-to-end Meta reconstruction across unlike accelerator backends.
+    llama_build(test-meta-mul-mat-id-expert-shard.cpp)
+    llama_test(test-meta-mul-mat-id-expert-shard NAME test-meta-mul-mat-id-expert-shard)
+    set_tests_properties(test-meta-mul-mat-id-expert-shard PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Full synthetic MoE graph through Meta partial materialization.
+    llama_build(test-meta-moe-chain.cpp)
+    llama_test(test-meta-moe-chain NAME test-meta-moe-chain)
+    set_tests_properties(test-meta-moe-chain PROPERTIES SKIP_RETURN_CODE 77)
+
+    llama_build(test-meta-expert-scheduler.cpp)
+    llama_test(test-meta-expert-scheduler NAME test-meta-expert-scheduler)
+    set_tests_properties(test-meta-expert-scheduler PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Manual exact-shape benchmark for heterogeneous MiMo routed experts.
+    # It is deliberately not registered with ctest because it allocates ~1.6 GiB.
+    llama_build(bench-mimo-expert-parallel.cpp)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+llama_build_and_test(test-model-load-order.cpp  LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 

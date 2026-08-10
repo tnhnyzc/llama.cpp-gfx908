@@ -346,12 +346,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+    static const std::regex pattern_v_weight        ("blk\\.\\d*\\.attn_v.weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
     static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
+    static const std::regex pattern_v_bias          ("blk\\.\\d*\\.attn_v\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_v_cache         ("cache_v_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -375,6 +378,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
     static const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
+    static const std::regex pattern_ffn_exps_weight    ("blk\\.\\d*\\.ffn_(gate|up|down|gate_up)_exps\\.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
@@ -426,7 +430,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(!suffix_fallback.empty());
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
-        GGML_ASSERT(tensor_axis_0 != nullptr);
+        if (tensor_axis_0 == nullptr) {
+            // Optional/MTP tensors can legitimately exist without the companion
+            // tensor used to inherit a split ratio. Mirroring is the conservative
+            // fallback: it preserves correctness and avoids rejecting the model.
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, il, rotation};
+        }
         return {axis, tensor_axis_0, il, rotation};
     };
 
@@ -478,6 +487,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // Expert-parallel Meta backends split complete experts rather than hidden rows/columns.
+        // MUL_MAT_ID keeps the logical output shape mirrored/partial and maps global router IDs
+        // to the local expert slab on each simple backend.
+        if (std::regex_match(tensor_name, pattern_ffn_exps_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -512,6 +527,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        if (std::regex_match(tensor_name, pattern_ffn_exps_weight)) {
+            GGML_ASSERT(axis == GGML_BACKEND_SPLIT_AXIS_2);
+            return {{tensor->ne[axis], 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
@@ -559,11 +578,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
-            const int64_t n_embd      = hparams.n_embd;
-            const int64_t n_embd_gqa  = hparams.n_embd_v_gqa(il);
-            GGML_ASSERT(hparams.n_embd_k_gqa() == n_embd_gqa);
-            GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
-            return {{n_embd, 1}, {n_embd_gqa, 2}};
+            const int64_t n_embd_q     = hparams.n_embd_head_k(il) * hparams.n_head(il);
+            const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            GGML_ASSERT(tensor->ne[axis] == n_embd_q + n_embd_k_gqa + n_embd_v_gqa);
+            if (n_embd_k_gqa == n_embd_v_gqa) {
+                return {{n_embd_q, 1}, {n_embd_k_gqa, 2}};
+            }
+            // Architectures such as MiMo use different K and V head widths.
+            // Preserve the three logical projections as independent segments
+            // instead of assuming that K and V can share one repeated segment.
+            return {{n_embd_q, 1}, {n_embd_k_gqa, 1}, {n_embd_v_gqa, 1}};
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias)) {
             const int64_t n_ff = hparams.n_ff(il);
@@ -582,6 +607,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (std::regex_match(tensor_name, pattern_ffn_exps_weight)) {
+            GGML_ASSERT(segments.size() == 1);
+            return {1};
+        }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
@@ -622,6 +651,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_q = std::lcm(n_embd_q, blck_size_perf);
+            const int64_t granularity_kv = granularity_q / n_gqa;
+            const int64_t n_embd_v_group = n_gqa * hparams.n_embd_head_v(il);
+            const int64_t granularity_v = std::lcm(n_embd_v_group, blck_size_perf) / n_gqa;
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
@@ -632,19 +664,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_q};
+                return {granularity_v * n_gqa};
             }
 
-            const int64_t granularity_kv = granularity_q / n_gqa;
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_kv};
+                const bool is_v = std::regex_match(tensor_name, pattern_v_weight) ||
+                    std::regex_match(tensor_name, pattern_v_bias) ||
+                    std::regex_match(tensor_name, pattern_v_cache);
+                return {is_v ? granularity_v : granularity_kv};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
-                GGML_ASSERT(segments.size() == 2);
-                return {granularity_q, granularity_kv};
+                if (segments.size() == 2) {
+                    return {granularity_q, granularity_kv};
+                }
+                GGML_ASSERT(segments.size() == 3);
+                return {granularity_q, granularity_kv, granularity_v};
             }
         }
 
@@ -668,7 +705,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        const float * tensor_split = ud->model->tensor_split();
+        const bool is_expert_weight = std::regex_match(tensor_name, pattern_ffn_exps_weight);
+        const float * tensor_split = is_expert_weight && ud->model->expert_tensor_split() != nullptr ?
+            ud->model->expert_tensor_split() : ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
@@ -1024,6 +1063,7 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    buft_list_t expert_buft_list;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -1037,6 +1077,7 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::vector<float> expert_tensor_split_owned;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1045,6 +1086,13 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.expert_tensor_split != nullptr) {
+        pimpl->expert_tensor_split_owned.assign(
+            params.expert_tensor_split, params.expert_tensor_split + llama_max_devices());
+        const bool all_zero = std::all_of(pimpl->expert_tensor_split_owned.begin(),
+            pimpl->expert_tensor_split_owned.end(), [](float value) { return value == 0.0f; });
+        this->params.expert_tensor_split = all_zero ? nullptr : pimpl->expert_tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1272,6 +1320,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+    }
+    if (expert_device.dev != nullptr) {
+        pimpl->expert_buft_list = make_gpu_buft_list(expert_device.dev, LLAMA_SPLIT_MODE_NONE, nullptr);
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1665,7 +1716,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const bool is_expert_weight = tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0 && (
+        tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+        tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+        tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS ||
+        tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS);
+    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr :
+        (is_expert_weight && !pimpl->expert_buft_list.empty() ?
+            &pimpl->expert_buft_list : pimpl->dev_layer.at(tn.bid).buft_list);
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -1701,6 +1759,10 @@ size_t llama_model::n_devices() const {
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+const float * llama_model::expert_tensor_split() const {
+    return params.expert_tensor_split;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -2434,6 +2496,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.expert_tensor_split         =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

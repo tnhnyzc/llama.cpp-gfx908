@@ -511,6 +511,21 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
         }
     }
 
+    // A materialized Meta tensor has a complete value on its primary simple
+    // backend. Let the destination backend copy from that tensor directly
+    // instead of forcing Meta -> host -> destination through the generic
+    // fallback. This is especially important for expert-only Meta regions
+    // embedded in an otherwise CUDA-resident graph.
+    if (ggml_backend_is_meta(backend_src) && ggml_backend_buffer_is_meta(src->buffer) &&
+            backend_dst->iface.cpy_tensor_async != NULL) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend_src, 0);
+        ggml_tensor * simple_src = ggml_backend_meta_simple_tensor(src, 0);
+        if (simple_src != NULL &&
+                backend_dst->iface.cpy_tensor_async(simple_backend, backend_dst, simple_src, dst)) {
+            return;
+        }
+    }
+
     // an async copy would normally happen after all the queued operations on both backends are completed
     // to simulate the same behavior, we need to synchronize both backends first, and do a blocking copy
     ggml_backend_synchronize(backend_src);

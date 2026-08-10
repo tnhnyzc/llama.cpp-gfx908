@@ -1516,12 +1516,25 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
-    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
-        const auto * weight = get_weight(ggml_get_name(cur));
-        if (weight == nullptr) {
-            // this can happen with split experts models
-            continue;
+    // Context order follows model construction order, which can jump repeatedly between
+    // GGUF shards and offsets. This is particularly costly with mmap: readahead for a
+    // mapping can be evicted before the next tensor from that mapping is consumed. Weight
+    // uploads are independent, so visit them in physical file order instead.
+    std::vector<ggml_tensor *> tensors;
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != nullptr; cur = ggml_get_next_tensor(ctx, cur)) {
+        if (get_weight(ggml_get_name(cur)) != nullptr) {
+            tensors.push_back(cur);
         }
+    }
+    std::stable_sort(tensors.begin(), tensors.end(), [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const auto & wa = require_weight(ggml_get_name(a));
+        const auto & wb = require_weight(ggml_get_name(b));
+        return wa.idx != wb.idx ? wa.idx < wb.idx : wa.offs < wb.offs;
+    });
+
+    for (ggml_tensor * cur : tensors) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        GGML_ASSERT(weight != nullptr);
 
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {

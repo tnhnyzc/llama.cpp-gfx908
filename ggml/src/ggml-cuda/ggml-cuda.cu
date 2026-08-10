@@ -2316,7 +2316,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, nullptr, dst);
         return;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
@@ -2330,7 +2330,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dst_vec.nb[1] = dst_vec.nb[0]*ne11;
         dst_vec.nb[2] = dst_vec.nb[1];
         dst_vec.nb[3] = dst_vec.nb[1];
-        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, nullptr, &dst_vec);
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
@@ -2345,7 +2345,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     if (!(q5_k_mmq_n3_gfx908 && q5_k_mmq_n3_shape) &&
         ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
-        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
@@ -2366,6 +2366,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int32_t expert_base = ggml_get_op_params_i32(dst, 2);
+    const int32_t local_expert_count = ggml_get_op_params_i32(dst, 3);
+    const bool expert_sharded = local_expert_count != 0;
+    GGML_ASSERT(!expert_sharded || local_expert_count == ne02);
+    cudaStream_t stream = ctx.stream();
+
+    // Sharded experts intentionally leave foreign router slots untouched.
+    // Clear once here so every specialized MMID path shares the same exact-zero
+    // contract without adding writes to its hot inner loop.
+    if (expert_sharded) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2374,23 +2386,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst, dst);
                     return;
                 }
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!expert_sharded && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!expert_sharded && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2398,8 +2410,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
-    cudaStream_t stream = ctx.stream();
-
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
 
@@ -2414,7 +2424,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, -1);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -2431,8 +2441,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
+                assert(expert_to_use >= 0);
+                if (!expert_sharded) {
+                    assert(expert_to_use < ne02);
+                }
+                if (expert_to_use == expert_base + i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
@@ -2440,6 +2453,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 }
             }
         }
+    }
+
+    // Preserve the fallback's dense gather/scatter layout for foreign experts.
+    // Their rows are placed after all locally-computed rows and remain zero in
+    // dst_sorted, so the final gather writes exact zero to the corresponding
+    // output slots without ever indexing a non-local expert weight.
+    for (int64_t i = 0; i < ne_get_rows; ++i) {
+        if (ids_from_sorted_host[i] != -1) {
+            continue;
+        }
+        GGML_ASSERT(expert_sharded);
+        ids_from_sorted_host[i] = ids_to_sorted_host.size();
+        ids_to_sorted_host.push_back(0);
     }
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
@@ -2459,6 +2485,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
+    if (expert_sharded) {
+        CUDA_CHECK(cudaMemsetAsync(dst_sorted.ptr, 0, ne2*n_expert_used*ne0*ts_dst_sorted, stream));
+    }
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
@@ -3987,7 +4016,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, ids ? up_n : nullptr,
+                            cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
@@ -4080,7 +4110,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, ids ? up_n : nullptr,
+                            cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
@@ -4135,7 +4166,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, up_n, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -4148,7 +4179,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, ids ? up_n : nullptr, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
                 break;
@@ -4174,7 +4205,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, up, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -4188,7 +4219,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, ids ? up : nullptr, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -4276,7 +4307,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, ids ? mm_node : nullptr, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
@@ -4334,14 +4365,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, mm_node, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, ids ? mm_node : nullptr, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;

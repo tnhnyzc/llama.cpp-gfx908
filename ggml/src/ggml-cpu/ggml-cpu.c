@@ -1564,6 +1564,14 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const int32_t expert_offset = ggml_get_op_params_i32(dst, 2);
+    const int32_t local_expert_count = ggml_get_op_params_i32(dst, 3);
+    const bool expert_sharded = local_expert_count != 0;
+    GGML_ASSERT(!expert_sharded || local_expert_count == n_as);
+
+    if (expert_sharded && ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
 
     void * wdata_cur = params->wdata;
 
@@ -1626,7 +1634,13 @@ static void ggml_compute_forward_mul_mat_id(
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t expert_id = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                if (expert_sharded && (expert_id < expert_offset || expert_id >= expert_offset + n_as)) {
+                    continue;
+                }
+
+                const int32_t i02 = expert_id - (expert_sharded ? expert_offset : 0);
 
                 assert(i02 >= 0 && i02 < n_as);
 

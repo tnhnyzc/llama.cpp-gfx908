@@ -3352,6 +3352,17 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_expert_offset(
+        struct ggml_tensor * tensor,
+                    int32_t   expert_offset) {
+    GGML_ASSERT(tensor->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(expert_offset >= 0);
+    GGML_ASSERT(tensor->src[0]->ne[2] > 0 && tensor->src[0]->ne[2] <= INT32_MAX);
+
+    ggml_set_op_params_i32(tensor, 2, expert_offset);
+    ggml_set_op_params_i32(tensor, 3, tensor->src[0]->ne[2]);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

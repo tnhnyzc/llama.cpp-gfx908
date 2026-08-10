@@ -6,9 +6,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
-#include <array>
 #include <cassert>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1797,13 +1795,6 @@ static ggml_guid_t ggml_backend_meta_guid() {
 }
 
 struct ggml_backend_meta_context {
-    struct pending_host_copy {
-        ggml_backend_t             backend_src = nullptr;
-        std::vector<ggml_tensor *> destinations;
-        size_t                     staging_index = 0;
-        size_t                     nbytes = 0;
-    };
-
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
@@ -1839,21 +1830,7 @@ struct ggml_backend_meta_context {
     bool                            skip_terminal_reduce = false;
     std::vector<std::vector<float>> host_allreduce_parts;
     std::vector<float>              host_allreduce_sum;
-    std::vector<ggml_backend_buffer_ptr> host_reduce_pinned_parts;
-    ggml_backend_buffer_ptr              host_reduce_pinned_sum;
-    std::vector<ggml_backend_buffer_ptr> copy_staging_buffers;
-    std::vector<pending_host_copy>       pending_host_copies;
-
-    bool                    profile_enabled = false;
-    uint64_t                profile_calls = 0;
-    double                  profile_total_us = 0.0;
-    double                  profile_input_sync_us = 0.0;
-    double                  profile_input_fanout_us = 0.0;
-    std::vector<double>     profile_submit_us;
-    double                  profile_reduce_get_us = 0.0;
-    std::vector<double>     profile_reduce_sync_us;
-    double                  profile_reduce_sum_us = 0.0;
-    double                  profile_reduce_enqueue_us = 0.0;
+    std::vector<uint8_t>            copy_staging;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -1910,7 +1887,6 @@ struct ggml_backend_meta_context {
         host_allreduce_enabled = n_devs >= 3 && host_allreduce != nullptr && strcmp(host_allreduce, "0") != 0;
         if (host_allreduce_enabled) {
             host_allreduce_parts.resize(n_devs);
-            host_reduce_pinned_parts.resize(n_devs);
             GGML_LOG_INFO("%s: heterogeneous host AllReduce enabled\n", __func__);
         }
         const char * host_reduce_primary = getenv("GGML_META_HOST_REDUCE_PRIMARY");
@@ -1923,13 +1899,6 @@ struct ggml_backend_meta_context {
         skip_terminal_reduce = skip_reduce != nullptr && strcmp(skip_reduce, "0") != 0;
         if (skip_terminal_reduce) {
             GGML_LOG_INFO("%s: terminal reduction omitted for timing probe\n", __func__);
-        }
-        const char * profile = getenv("GGML_META_PROFILE");
-        profile_enabled = profile != nullptr && strcmp(profile, "0") != 0;
-        if (profile_enabled) {
-            profile_submit_us.resize(n_devs, 0.0);
-            profile_reduce_sync_us.resize(n_devs, 0.0);
-            GGML_LOG_INFO("%s: phase profiling enabled\n", __func__);
         }
 
         // Backend-private collectives may cast every context to their own
@@ -2007,58 +1976,19 @@ static bool ggml_backend_meta_cpy_tensor_async(
         return true;
     }
 
-    // Expert graphs normally have several inputs from the same CUDA graph
-    // (activation, route ids, route weights). Queue all D2H reads into pinned
-    // staging now; graph_compute() synchronizes the source once and fans every
-    // staged input to the non-primary backends. This removes one hard source
-    // synchronization per input tensor.
-    if (backend_ctx->host_allreduce_enabled) {
-        const size_t staging_index = backend_ctx->pending_host_copies.size();
-        if (staging_index >= backend_ctx->copy_staging_buffers.size()) {
-            backend_ctx->copy_staging_buffers.emplace_back(nullptr);
-        }
-
-        ggml_backend_buffer_ptr & staging = backend_ctx->copy_staging_buffers[staging_index];
-        if (!staging || ggml_backend_buffer_get_size(staging.get()) < nbytes) {
-            ggml_backend_buffer_type_t host_buft =
-                ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend_src));
-            if (host_buft != nullptr) {
-                staging.reset(ggml_backend_buft_alloc_buffer(host_buft, nbytes));
-            }
-        }
-
-        if (staging) {
-            void * staging_data = ggml_backend_buffer_get_base(staging.get());
-            ggml_backend_tensor_get_async(backend_src, src, staging_data, 0, nbytes);
-
-            ggml_backend_meta_context::pending_host_copy pending;
-            pending.backend_src = backend_src;
-            pending.destinations.resize(n_backends, nullptr);
-            pending.staging_index = staging_index;
-            pending.nbytes = nbytes;
-            for (size_t j = 0; j < n_backends; ++j) {
-                if (!copied_directly[j]) {
-                    pending.destinations[j] = ggml_backend_meta_buffer_simple_tensor(dst, j);
-                    GGML_ASSERT(pending.destinations[j] != nullptr);
-                }
-            }
-            backend_ctx->pending_host_copies.push_back(std::move(pending));
-            return true;
-        }
-    }
-
-    // Conservative fallback for Meta configurations that do not use the
-    // heterogeneous expert reduction path or cannot allocate pinned staging.
+    // The source may still be executing on its backend stream. Synchronize
+    // once, read it once, then fan that staging copy out only to backends that
+    // cannot consume the source directly.
     ggml_backend_synchronize(backend_src);
-    std::vector<uint8_t> copy_staging(nbytes);
-    ggml_backend_tensor_get(src, copy_staging.data(), 0, nbytes);
+    backend_ctx->copy_staging.resize(nbytes);
+    ggml_backend_tensor_get(src, backend_ctx->copy_staging.data(), 0, nbytes);
     for (size_t j = 0; j < n_backends; ++j) {
         if (copied_directly[j]) {
             continue;
         }
         ggml_tensor * simple_dst = ggml_backend_meta_buffer_simple_tensor(dst, j);
         GGML_ASSERT(simple_dst != nullptr);
-        ggml_backend_tensor_set(simple_dst, copy_staging.data(), 0, nbytes);
+        ggml_backend_tensor_set(simple_dst, backend_ctx->copy_staging.data(), 0, nbytes);
     }
     return true;
 }
@@ -2173,47 +2103,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
-    using profile_clock = std::chrono::steady_clock;
-    const auto profile_graph_start = profile_clock::now();
-    double profile_input_sync_us = 0.0;
-    double profile_input_fanout_us = 0.0;
-    std::array<double, 128> profile_submit_us = {};
-    double profile_reduce_get_us = 0.0;
-    std::array<double, 128> profile_reduce_sync_us = {};
-    double profile_reduce_sum_us = 0.0;
-    double profile_reduce_enqueue_us = 0.0;
-    GGML_ASSERT(n_backends <= profile_submit_us.size());
-
-    if (!backend_ctx->pending_host_copies.empty()) {
-        const auto profile_sync_start = profile_clock::now();
-        std::vector<ggml_backend_t> synchronized_sources;
-        synchronized_sources.reserve(backend_ctx->pending_host_copies.size());
-        for (const auto & pending : backend_ctx->pending_host_copies) {
-            if (std::find(synchronized_sources.begin(), synchronized_sources.end(), pending.backend_src) ==
-                    synchronized_sources.end()) {
-                ggml_backend_synchronize(pending.backend_src);
-                synchronized_sources.push_back(pending.backend_src);
-            }
-        }
-        const auto profile_fanout_start = profile_clock::now();
-        profile_input_sync_us += std::chrono::duration<double, std::micro>(
-            profile_fanout_start - profile_sync_start).count();
-
-        for (const auto & pending : backend_ctx->pending_host_copies) {
-            const void * staging_data = ggml_backend_buffer_get_base(
-                backend_ctx->copy_staging_buffers[pending.staging_index].get());
-            for (size_t j = 0; j < n_backends; ++j) {
-                if (pending.destinations[j] == nullptr) {
-                    continue;
-                }
-                ggml_backend_tensor_set_async(backend_ctx->backend_configs[j].backend,
-                    pending.destinations[j], staging_data, 0, pending.nbytes);
-            }
-        }
-        profile_input_fanout_us += std::chrono::duration<double, std::micro>(
-            profile_clock::now() - profile_fanout_start).count();
-        backend_ctx->pending_host_copies.clear();
-    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -2620,113 +2509,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             if (supported) {
                 backend_ctx->host_allreduce_sum.resize(nelements);
-                const bool primary_only = backend_ctx->host_reduce_primary_enabled &&
-                    i + 1 == backend_ctx->n_subgraphs;
-                const size_t first_host_part = primary_only ? 1 : 0;
-
-                if (primary_only) {
-                    const auto profile_get_start = profile_clock::now();
-                    std::vector<const float *> part_data(n_backends, nullptr);
-                    bool pinned_ready = true;
-                    for (size_t j = 1; j < n_backends; ++j) {
-                        if ((nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-                            continue;
-                        }
-                        const ggml_backend_buffer_t node_buffer = nodes[j]->view_src != nullptr ?
-                            nodes[j]->view_src->buffer : nodes[j]->buffer;
-                        if (ggml_backend_buffer_is_host(node_buffer)) {
-                            part_data[j] = static_cast<const float *>(nodes[j]->data);
-                            continue;
-                        }
-
-                        ggml_backend_buffer_ptr & pinned = backend_ctx->host_reduce_pinned_parts[j];
-                        if (!pinned || ggml_backend_buffer_get_size(pinned.get()) < nbytes) {
-                            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(
-                                ggml_backend_get_device(backend_ctx->backend_configs[j].backend));
-                            if (host_buft == nullptr) {
-                                pinned_ready = false;
-                                break;
-                            }
-                            pinned.reset(ggml_backend_buft_alloc_buffer(host_buft, nbytes));
-                        }
-                        if (!pinned) {
-                            pinned_ready = false;
-                            break;
-                        }
-                        part_data[j] = static_cast<const float *>(ggml_backend_buffer_get_base(pinned.get()));
-                        ggml_backend_tensor_get_async(backend_ctx->backend_configs[j].backend, nodes[j],
-                            const_cast<float *>(part_data[j]), 0, nbytes);
-                    }
-                    profile_reduce_get_us += std::chrono::duration<double, std::micro>(
-                        profile_clock::now() - profile_get_start).count();
-
-                    ggml_backend_buffer_type_t primary_host_buft = ggml_backend_dev_host_buffer_type(
-                        ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
-                    if (primary_host_buft == nullptr) {
-                        pinned_ready = false;
-                    } else if (!backend_ctx->host_reduce_pinned_sum ||
-                            ggml_backend_buffer_get_size(backend_ctx->host_reduce_pinned_sum.get()) < nbytes) {
-                        backend_ctx->host_reduce_pinned_sum.reset(
-                            ggml_backend_buft_alloc_buffer(primary_host_buft, nbytes));
-                        pinned_ready = backend_ctx->host_reduce_pinned_sum != nullptr;
-                    }
-
-                    if (pinned_ready) {
-                        for (size_t j = 1; j < n_backends; ++j) {
-                            const auto profile_sync_start = profile_clock::now();
-                            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
-                            profile_reduce_sync_us[j] += std::chrono::duration<double, std::micro>(
-                                profile_clock::now() - profile_sync_start).count();
-                        }
-
-                        const auto profile_sum_start = profile_clock::now();
-                        float * delta = static_cast<float *>(
-                            ggml_backend_buffer_get_base(backend_ctx->host_reduce_pinned_sum.get()));
-                        std::fill(delta, delta + nelements, 0.0f);
-                        for (size_t j = 1; j < n_backends; ++j) {
-                            if (part_data[j] == nullptr) {
-                                continue;
-                            }
-                            for (int64_t k = 0; k < nelements; ++k) {
-                                delta[k] += part_data[j][k];
-                            }
-                        }
-                        profile_reduce_sum_us += std::chrono::duration<double, std::micro>(
-                            profile_clock::now() - profile_sum_start).count();
-
-                        const auto profile_enqueue_start = profile_clock::now();
-                        ggml_tensor * node_delta = get_node_aux(nodes[0]);
-                        set_tmp_data(node_delta, 0, 0);
-                        ggml_backend_tensor_set_async(backend_ctx->backend_configs[0].backend,
-                            node_delta, delta, 0, nbytes);
-
-                        ggml_tensor * node_red = get_node_aux(nodes[0]);
-                        node_red->view_src = nodes[0]->view_src == nullptr ? nodes[0] : nodes[0]->view_src;
-                        node_red->view_offs = nodes[0]->view_offs;
-                        node_red->op = GGML_OP_ADD;
-                        node_red->src[0] = nodes[0];
-                        node_red->src[1] = node_delta;
-                        node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                        ggml_backend_view_init(node_red);
-
-                        ggml_cgraph * cgraph_aux = get_cgraph_aux();
-                        cgraph_aux->nodes[0] = node_red;
-                        cgraph_aux->n_nodes = 1;
-                        const ggml_status status = ggml_backend_graph_compute_async(
-                            backend_ctx->backend_configs[0].backend, cgraph_aux);
-                        profile_reduce_enqueue_us += std::chrono::duration<double, std::micro>(
-                            profile_clock::now() - profile_enqueue_start).count();
-                        return status;
-                    }
-                }
-
-                // For a terminal reduction whose consumer is on the primary
-                // backend, keep the primary contribution resident.  Only the
-                // non-primary contributions need to cross the host boundary;
-                // upload their sum as a delta and add it to the primary value
-                // on that backend.  This avoids a needless primary D2H copy
-                // and the final full-value H2D round trip for every MoE layer.
-                for (size_t j = first_host_part; j < n_backends; ++j) {
+                for (size_t j = 0; j < n_backends; ++j) {
                     backend_ctx->host_allreduce_parts[j].resize(nelements);
                     if (nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) {
                         ggml_backend_tensor_get_async(backend_ctx->backend_configs[j].backend, nodes[j],
@@ -2734,12 +2517,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
 
-                for (size_t j = first_host_part; j < n_backends; ++j) {
+                for (size_t j = 0; j < n_backends; ++j) {
                     ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
                 }
 
                 std::fill(backend_ctx->host_allreduce_sum.begin(), backend_ctx->host_allreduce_sum.end(), 0.0f);
-                for (size_t j = first_host_part; j < n_backends; ++j) {
+                for (size_t j = 0; j < n_backends; ++j) {
                     if ((nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                         continue;
                     }
@@ -2749,26 +2532,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
 
+                const bool primary_only = backend_ctx->host_reduce_primary_enabled &&
+                    i + 1 == backend_ctx->n_subgraphs;
                 if (primary_only) {
-                    ggml_tensor * node_delta = get_node_aux(nodes[0]);
-                    set_tmp_data(node_delta, 0, 0);
-                    ggml_backend_tensor_set_async(backend_ctx->backend_configs[0].backend, node_delta,
+                    ggml_backend_tensor_set_async(backend_ctx->backend_configs[0].backend, nodes[0],
                         backend_ctx->host_allreduce_sum.data(), 0, nbytes);
-
-                    ggml_tensor * node_red = get_node_aux(nodes[0]);
-                    node_red->view_src = nodes[0]->view_src == nullptr ? nodes[0] : nodes[0]->view_src;
-                    node_red->view_offs = nodes[0]->view_offs;
-                    node_red->op = GGML_OP_ADD;
-                    node_red->src[0] = nodes[0];
-                    node_red->src[1] = node_delta;
-                    node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                    ggml_backend_view_init(node_red);
-
-                    ggml_cgraph * cgraph_aux = get_cgraph_aux();
-                    cgraph_aux->nodes[0] = node_red;
-                    cgraph_aux->n_nodes = 1;
-                    return ggml_backend_graph_compute_async(
-                        backend_ctx->backend_configs[0].backend, cgraph_aux);
                 } else {
                     for (size_t j = 0; j < n_backends; ++j) {
                         ggml_backend_tensor_set_async(backend_ctx->backend_configs[j].backend, nodes[j],
@@ -2895,10 +2663,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
-            const auto profile_submit_start = profile_clock::now();
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            profile_submit_us[j] += std::chrono::duration<double, std::micro>(
-                profile_clock::now() - profile_submit_start).count();
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2926,51 +2691,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
-        }
-    }
-
-    if (backend_ctx->profile_enabled) {
-        backend_ctx->profile_calls++;
-        backend_ctx->profile_total_us += std::chrono::duration<double, std::micro>(
-            profile_clock::now() - profile_graph_start).count();
-        backend_ctx->profile_input_sync_us += profile_input_sync_us;
-        backend_ctx->profile_input_fanout_us += profile_input_fanout_us;
-        backend_ctx->profile_reduce_get_us += profile_reduce_get_us;
-        backend_ctx->profile_reduce_sum_us += profile_reduce_sum_us;
-        backend_ctx->profile_reduce_enqueue_us += profile_reduce_enqueue_us;
-        for (size_t j = 0; j < n_backends; ++j) {
-            backend_ctx->profile_submit_us[j] += profile_submit_us[j];
-            backend_ctx->profile_reduce_sync_us[j] += profile_reduce_sync_us[j];
-        }
-
-        constexpr uint64_t profile_interval = 480;
-        if (backend_ctx->profile_calls == profile_interval) {
-            const double inv = 1.0 / double(profile_interval);
-            GGML_LOG_INFO(
-                "meta_profile: calls=%llu mean_us total=%.2f input_sync=%.2f input_fanout=%.2f "
-                "submit0=%.2f submit1=%.2f submit2=%.2f reduce_get=%.2f "
-                "reduce_sync1=%.2f reduce_sync2=%.2f reduce_sum=%.2f reduce_enqueue=%.2f\n",
-                (unsigned long long) profile_interval,
-                backend_ctx->profile_total_us * inv,
-                backend_ctx->profile_input_sync_us * inv,
-                backend_ctx->profile_input_fanout_us * inv,
-                n_backends > 0 ? backend_ctx->profile_submit_us[0] * inv : 0.0,
-                n_backends > 1 ? backend_ctx->profile_submit_us[1] * inv : 0.0,
-                n_backends > 2 ? backend_ctx->profile_submit_us[2] * inv : 0.0,
-                backend_ctx->profile_reduce_get_us * inv,
-                n_backends > 1 ? backend_ctx->profile_reduce_sync_us[1] * inv : 0.0,
-                n_backends > 2 ? backend_ctx->profile_reduce_sync_us[2] * inv : 0.0,
-                backend_ctx->profile_reduce_sum_us * inv,
-                backend_ctx->profile_reduce_enqueue_us * inv);
-            backend_ctx->profile_calls = 0;
-            backend_ctx->profile_total_us = 0.0;
-            backend_ctx->profile_input_sync_us = 0.0;
-            backend_ctx->profile_input_fanout_us = 0.0;
-            backend_ctx->profile_reduce_get_us = 0.0;
-            backend_ctx->profile_reduce_sum_us = 0.0;
-            backend_ctx->profile_reduce_enqueue_us = 0.0;
-            std::fill(backend_ctx->profile_submit_us.begin(), backend_ctx->profile_submit_us.end(), 0.0);
-            std::fill(backend_ctx->profile_reduce_sync_us.begin(), backend_ctx->profile_reduce_sync_us.end(), 0.0);
         }
     }
     return GGML_STATUS_SUCCESS;

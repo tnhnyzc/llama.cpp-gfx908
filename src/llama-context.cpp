@@ -333,6 +333,15 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        if (model.expert_device.dev != nullptr) {
+            ggml_backend_t backend = ggml_backend_dev_init(model.expert_device.dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s expert backend",
+                    ggml_backend_dev_name(model.expert_device.dev)));
+            }
+            backends.emplace_back(backend);
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
