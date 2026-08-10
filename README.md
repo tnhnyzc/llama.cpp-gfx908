@@ -1,5 +1,8 @@
 # llama.cpp
 
+> [!IMPORTANT]
+> This repository is the independently maintained `gfx908` / AMD Instinct MI100 optimization fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The default `gfx908-production` branch is the qualified fork release; general llama.cpp documentation below follows upstream. Start with the [gfx908 project guide](docs/gfx908/README.md) for hardware scope, build instructions, measured results, current status, and rollback controls.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
