@@ -377,6 +377,14 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
+                // Diagnostic screen for the gfx908 IQ4_NL B1 output-tile
+                // schedule. Keep the qualified two-row tile, but let one
+                // physical wave own the complete K range so the generic
+                // kernel drops its inter-wave LDS exchange and barrier.
+                // This deliberately changes the FP32 reduction order; it is
+                // only the relaxed performance ceiling used to decide
+                // whether a partition-preserving prototype is warranted.
+                return type == GGML_TYPE_IQ4_NL ? 1 : 2;
             case 3:
             case 4:
                 return 2;
