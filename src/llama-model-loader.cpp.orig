@@ -1346,7 +1346,6 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
-            mmap_population_ranges.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
@@ -1359,54 +1358,6 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
         size_data += ggml_nbytes(it.second.tensor);
-    }
-}
-
-void llama_model_loader::record_mmap_range(uint32_t idx, size_t first, size_t last) {
-    auto & range = mmap_population_ranges.at(idx);
-    range.first  = std::min(range.first, first);
-    range.second = std::max(range.second, last);
-}
-
-void llama_model_loader::start_mmap_population() {
-    if (!use_mmap || mmap_population_started) {
-        return;
-    }
-    mmap_population_started = true;
-
-    size_t mapped_bytes = 0;
-    size_t file_bytes = 0;
-    std::vector<llama_mmap *> population_mappings;
-    population_mappings.reserve(mappings.size());
-    for (size_t idx = 0; idx < mappings.size(); ++idx) {
-        const auto & range = mmap_population_ranges.at(idx);
-        file_bytes += mappings.at(idx)->size();
-        if (range.second > range.first) {
-            mapped_bytes += range.second - range.first;
-        }
-        population_mappings.push_back(mappings.at(idx).get());
-    }
-
-    if (mapped_bytes == 0 || mapped_bytes >= file_bytes) {
-        return;
-    }
-
-    LLAMA_LOG_INFO("%s: populating %.2f MiB of CPU-mapped model data during tensor loading\n", __func__, mapped_bytes / 1024.0 / 1024.0);
-    auto population_ranges = mmap_population_ranges;
-    mmap_population = std::async(std::launch::async, [population_mappings = std::move(population_mappings), population_ranges = std::move(population_ranges)] {
-        for (size_t idx = population_mappings.size(); idx-- > 0;) {
-            const auto & range = population_ranges.at(idx);
-            if (range.second > range.first) {
-                population_mappings.at(idx)->populate_range_reverse(range.first, range.second);
-            }
-        }
-        LLAMA_LOG_INFO("llama_model_loader: CPU mmap population complete\n");
-    });
-}
-
-void llama_model_loader::wait_mmap_population() {
-    if (mmap_population.valid()) {
-        mmap_population.get();
     }
 }
 
@@ -1463,7 +1414,6 @@ bool llama_model_loader::load_all_data(
         return true;
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
-    start_mmap_population();
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
@@ -1716,7 +1666,6 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
-            wait_mmap_population();
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
