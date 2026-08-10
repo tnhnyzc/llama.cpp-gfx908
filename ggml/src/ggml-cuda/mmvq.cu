@@ -358,6 +358,12 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// Build-time experiment control for the gfx908 MMVQ N3 wave count. The
+// default preserves the production value; the candidate build sets it to 1.
+#ifndef GFX908_NWARPS_N3
+#define GFX908_NWARPS_N3 2
+#endif
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
@@ -377,9 +383,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
-            case 3:
             case 4:
                 return 2;
+            case 3:
+                return GFX908_NWARPS_N3;
             case 2:
                 return 2;
             case 5:
