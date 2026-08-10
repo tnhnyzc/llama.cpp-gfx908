@@ -803,6 +803,60 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+#if defined(CDNA1)
+__launch_bounds__(2*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_iq4_nl_n1_stripped(
+        const void * vx_ptr, const block_q8_1 * y, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x) {
+    constexpr int qk = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qk;
+    constexpr int qi = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qi;
+    constexpr int vdr = get_vdr_mmvq(GGML_TYPE_IQ4_NL);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = 2;
+    constexpr int rows_per_block = 2;
+    constexpr int blocks_per_iter = vdr*nwarps*warp_size/qi;
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const int row0 = rows_per_block*blockIdx.x;
+    const int blocks_per_row_x = ncols_x/qk;
+    const int kbx_offset = row0*stride_row_x;
+
+    ggml_cuda_pdl_sync();
+
+    float tmp[rows_per_block] = {0.0f, 0.0f};
+    for (int kbx = tid/(qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx*(qk/QK8_1);
+        const int kqs = vdr*(tid % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < rows_per_block; ++i) {
+            tmp[i] += vec_dot_iq4_nl_q8_1(vx_ptr, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[rows_per_block][warp_size];
+    if (threadIdx.y == 1) {
+#pragma unroll
+        for (int i = 0; i < rows_per_block; ++i) {
+            tmp_shared[i][threadIdx.x] = tmp[i];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y == 1) {
+        return;
+    }
+
+#pragma unroll
+    for (int i = 0; i < rows_per_block; ++i) {
+        tmp[i] += tmp_shared[i][threadIdx.x];
+        tmp[i] = warp_reduce_sum_dpp<warp_size>(tmp[i]);
+    }
+
+    if (threadIdx.x < rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+        dst[row0 + threadIdx.x] = tmp[threadIdx.x];
+    }
+}
+#endif
+
 // CDNA1 M=2 gate/up fusion. Separate wave groups own the up and gate
 // projections so each thread keeps only one matrix's accumulators. The two
 // groups exchange final row values through LDS before applying GLU.
@@ -1049,6 +1103,11 @@ static int mmvq_rows_override(ggml_type type) {
     return type == GGML_TYPE_Q5_K ? 1 : 2;
 }
 
+static bool iq4_n1_stripped_enabled() {
+    static const char * env = std::getenv("GGML_HIP_IQ4_NL_N1_STRIPPED_GFX908");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1109,6 +1168,16 @@ static void mul_mat_vec_q_switch_fusion(
                 } else {
                     switch (rows_override) {
                         case 2:
+#if defined(CDNA1)
+                            if constexpr (type == GGML_TYPE_IQ4_NL && !small_k) {
+                                const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+                                if (cc == GGML_CUDA_CC_CDNA1 && ids == nullptr && block_nums.y == 1 && block_nums.z == 1 && iq4_n1_stripped_enabled()) {
+                                    ggml_cuda_kernel_launch(mul_mat_vec_iq4_nl_n1_stripped, launch_params,
+                                        vx, (const block_q8_1 *) vy, dst, ncols_x, stride_col_dst, stride_row_x);
+                                    return;
+                                }
+                            }
+#endif
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 2>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
