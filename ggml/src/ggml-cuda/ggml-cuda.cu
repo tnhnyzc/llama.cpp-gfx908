@@ -3663,6 +3663,69 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static int ggml_cuda_shared_norm_q8_consumer_count(const ggml_cgraph * cgraph, const ggml_tensor * input) {
+    int consumers = 0;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            if (node->src[source] != input) {
+                continue;
+            }
+            if (source != 1 || node->op != GGML_OP_MUL_MAT ||
+                    (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                    !ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+                return 0;
+            }
+            ++consumers;
+        }
+    }
+
+    return consumers >= 1 && consumers <= 3 ? consumers : 0;
+}
+
+static int ggml_cuda_shared_norm_q8_eligible(const ggml_cgraph * cgraph, int node_idx) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_SHARED_NORM_Q8_GFX908");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enabled || ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_CDNA1 || node_idx + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return 0;
+    }
+
+    const ggml_tensor * input = rms_norm->src[0];
+    const ggml_tensor * scale = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (input->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            input->ne[0] != 5120 || ggml_nelements(input) != 5120 ||
+            !ggml_are_same_shape(input, scale) || !ggml_is_contiguous(input) || !ggml_is_contiguous(scale)) {
+        return 0;
+    }
+
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a_start = (uintptr_t) a->data;
+        const uintptr_t b_start = (uintptr_t) b->data;
+        return a_start < b_start + ggml_nbytes(b) && b_start < a_start + ggml_nbytes(a);
+    };
+    if (overlaps(mul, input) || overlaps(mul, scale)) {
+        return 0;
+    }
+
+    const size_t q8_size = GGML_PAD(input->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1;
+    if (q8_size + sizeof(float) > ggml_nbytes(mul)) {
+        return 0;
+    }
+
+    return ggml_cuda_shared_norm_q8_consumer_count(cgraph, mul);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4358,6 +4421,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        const int shared_q8_consumers = ggml_cuda_shared_norm_q8_eligible(cgraph, i);
+        if (shared_q8_consumers > 0) {
+            ggml_tensor * mul = cgraph->nodes[i + 1];
+            ggml_cuda_op_rms_norm_fused_q8_1(*cuda_ctx, node, mul);
+            cuda_ctx->shared_q8_1_inputs.insert(mul);
+            return 1;
+        }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
@@ -4625,6 +4695,8 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    cuda_ctx->shared_q8_1_inputs.clear();
 
     ggml_cuda_set_device(cuda_ctx->device);
 
