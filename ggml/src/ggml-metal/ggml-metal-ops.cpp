@@ -299,6 +299,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_unary(ctx, idx);
             } break;
+        case GGML_OP_SILU_BACK:
+            {
+                n_fuse = ggml_metal_op_silu_back(ctx, idx);
+            } break;
         case GGML_OP_GLU:
             {
                 n_fuse = ggml_metal_op_glu(ctx, idx);
@@ -315,6 +319,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_CUMSUM:
             {
                 n_fuse = ggml_metal_op_cumsum(ctx, idx);
+            } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
             } break;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
@@ -1299,6 +1307,72 @@ int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, 32, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(op->op == GGML_OP_LIGHTNING_INDEXER);
+
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * w = op->src[2];
+    const ggml_tensor * m = op->src[3];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32  ||
+                k->type == GGML_TYPE_F16  ||
+                k->type == GGML_TYPE_BF16 ||
+                k->type == GGML_TYPE_Q4_0 ||
+                k->type == GGML_TYPE_Q4_1 ||
+                k->type == GGML_TYPE_Q5_0 ||
+                k->type == GGML_TYPE_Q5_1 ||
+                k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(m->type == GGML_TYPE_F16);
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(q->ne[0] == OP_LIGHTNING_INDEXER_DK);
+    GGML_ASSERT(q->ne[1] == OP_LIGHTNING_INDEXER_NH);
+
+    ggml_metal_kargs_lightning_indexer args = {
+        /*.n_kv      =*/ (int32_t) k->ne[2],
+        /*.n_batch   =*/ (int32_t) q->ne[2],
+        /*.mask_ne3  =*/ (int32_t) m->ne[3],
+        /*.nb1       =*/ op->nb[1],
+        /*.nb3       =*/ op->nb[3],
+        /*.nbq1      =*/ q->nb[1],
+        /*.nbq2      =*/ q->nb[2],
+        /*.nbq3      =*/ q->nb[3],
+        /*.nbk2      =*/ k->nb[2],
+        /*.nbk3      =*/ k->nb[3],
+        /*.nbw1      =*/ w->nb[1],
+        /*.nbw3      =*/ w->nb[3],
+        /*.nbm1      =*/ m->nb[1],
+        /*.nbm3      =*/ m->nb[3],
+    };
+
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),  1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),  2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w),  3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m),  4);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+
+    const int nsg   = OP_LIGHTNING_INDEXER_NSG;
+    const int nkptg = OP_LIGHTNING_INDEXER_NKPSG*nsg;
+    const int nbptg = OP_LIGHTNING_INDEXER_NBPTG;
+
+    auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(ctx->lib, op);
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc,
+            (k->ne[2] + nkptg - 1)/nkptg,
+            (q->ne[2] + nbptg - 1)/nbptg,
+            q->ne[3], 32, nsg, 1);
 
     return 1;
 }
@@ -3334,9 +3408,6 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
-
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[1]));
 
@@ -3474,6 +3545,36 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     }
 
     return n_fuse;
+}
+
+int ggml_metal_op_silu_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto pipeline = ggml_metal_library_get_pipeline_silu_back(lib, op);
+
+    const int64_t ne = ggml_nelements(op);
+
+    ggml_metal_kargs_silu_back args = {
+        /*.ne =*/ ne,
+    };
+
+    int arg_idx{0};
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), arg_idx++);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), arg_idx++);
+
+    const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne);
+    const int64_t n = (ne + nth - 1) / nth;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
@@ -3715,7 +3816,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     }
 
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-    nth = std::min(nth, args.ne00_t);
+    nth = std::min(nth, (args.ne00_t + 31)/32*32);
 
     const size_t smem = pipeline.smem;
 
