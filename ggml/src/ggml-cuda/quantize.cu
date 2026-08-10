@@ -1,5 +1,6 @@
 #include "quantize.cuh"
 #include <cstdint>
+#include <cstdlib>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
@@ -564,9 +565,18 @@ void quantize_row_q8_1_cuda(
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
 
-    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+    // Measurement-only launch-geometry sweep. The environment is read while
+    // the graph is captured, so replay contains neither a lookup nor a branch.
+    // The kernel's launch bound remains 256; all accepted values are smaller
+    // multiples of the 32-value q8_1 reduction subgroup.
+    const char * qfix_block_env = std::getenv("GGML_HIP_Q8_1_BLOCK_GFX908");
+    const int qfix_block_value = qfix_block_env ? std::atoi(qfix_block_env) : CUDA_QUANTIZE_BLOCK_SIZE;
+    const int block_value = qfix_block_value == 32 || qfix_block_value == 64 ||
+                            qfix_block_value == 128 || qfix_block_value == 256 ?
+                            qfix_block_value : CUDA_QUANTIZE_BLOCK_SIZE;
+    const int64_t block_num_x = (ne0 + block_value - 1) / block_value;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const dim3 block_size(block_value, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
     ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
     GGML_UNUSED(type_src0);

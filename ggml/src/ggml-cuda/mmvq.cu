@@ -6,6 +6,20 @@
 #include <cstdint>
 #include <cstdlib>
 
+// Measurement-only decomposition of the B1 fixed MMVQ intercept. The mode is
+// read while a graph is captured, not while it is replayed, so the measurement
+// itself contains no environment lookup or branch:
+// 0 = normal route, 1 = quantize only, 2 = MMVQ only, 3 = neither dispatch,
+// 4 = quantize off + launch-shaped empty MMVQ node,
+// 5 = quantize off + launch-shaped one-store MMVQ sentinel,
+// 6 = quantize off + real MMVQ code object with the dot-product loop skipped,
+// 7 = mode 6 plus the LDS/DPP reduction skipped (one workgroup store remains).
+static int get_qfix_decompose_mode() {
+    const char * value = std::getenv("GGML_HIP_QFIX_DECOMPOSE");
+    const int mode = value ? std::atoi(value) : 0;
+    return mode >= 0 && mode <= 7 ? mode : 0;
+}
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -493,7 +507,7 @@ static __global__ void mul_mat_vec_q(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride) {
+        const uint32_t ids_stride, const int qfix_phase) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -599,11 +613,12 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+    if (qfix_phase == 0) {
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+            // x block quant index when casting the quants to int
+            const int kqs = vdr * (tid % (qi/vdr));
 
 #if defined(CDNA1)
         if constexpr (type == GGML_TYPE_Q4_K && ncols_dst == 2) {
@@ -668,22 +683,43 @@ static __global__ void mul_mat_vec_q(
             }
         } else
 #endif // defined(CDNA1)
-        {
+            {
 #pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
+                for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp[j][i] += vec_dot_q_cuda(
-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                    if constexpr (has_fusion) {
-                        if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_q_cuda(
-                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        tmp[j][i] += vec_dot_q_cuda(
+                            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                tmp_gate[j][i] += vec_dot_q_cuda(
+                                    vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            }
                         }
                     }
                 }
             }
         }
+    } else if (qfix_phase == 1) {
+        // Runtime-selected destructive control. Keeping this in the real code
+        // object preserves its static VGPR/LDS contract while removing all
+        // weight/q8 loads, dequantization, and accumulation. Thread-dependent
+        // values force the existing LDS/DPP reduction and store path to run.
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                tmp[j][i] = float(((tid + 3*i + 5*j + blockIdx.x) & 31) + 1);
+            }
+        }
+    } else {
+        // Same real code object and common prologue, but no dot-product loop,
+        // LDS exchange, wave reduction, or normal output path. This separates
+        // the reduction increment from static-resource/prologue node cost.
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            dst_ptr[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0] = 0.0f;
+        }
+        return;
     }
 
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
@@ -1049,6 +1085,33 @@ static int mmvq_rows_override(ggml_type type) {
     return type == GGML_TYPE_Q5_K ? 1 : 2;
 }
 
+// Measurement-only controls launched from the selected MMVQ launch site.
+// Both retain the real kernel's argument ABI, grid, block dimensions, dynamic
+// shared-memory request, stream, and captured-graph position. The empty arm
+// measures launch/scheduling minimum; the sentinel adds one coalescing-
+// irrelevant store per workgroup so a degenerate no-op code object cannot be
+// mistaken for the whole minimum-node cost. Static LDS and register allocation
+// are intentionally not forged: doing so would require adding kernel work and
+// would no longer be an empty control.
+template<ggml_type type, int ncols_dst, bool touch_dst, bool small_k = false>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void qfix_matched_mmvq_control(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x,
+        const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint3 channel_ratio, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint3 sample_ratio, const uint32_t stride_sample_x,
+        const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const uint32_t ids_stride) {
+    if constexpr (touch_dst) {
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+            dst_ptr[blockIdx.z*stride_sample_dst + blockIdx.y*stride_channel_dst + blockIdx.x] = 0.0f;
+        }
+    }
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1061,6 +1124,30 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    const int qfix_mode = get_qfix_decompose_mode();
+    const int qfix_phase = qfix_mode == 6 ? 1 : qfix_mode == 7 ? 2 : 0;
+    if (qfix_phase != 0) {
+        GGML_ASSERT(type == GGML_TYPE_IQ4_NL && c_ncols_dst == 1 && !has_fusion && rows_override == 2 &&
+                    "QFIX phase control covers only the exact gfx908 IQ4_NL N1 rows=2 route");
+    }
+    if (qfix_mode == 4 || qfix_mode == 5) {
+        GGML_ASSERT(!has_fusion && "QFIX matched controls cover the non-fused B1 route only");
+        const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, nbytes_shared, stream);
+        if (qfix_mode == 4) {
+            ggml_cuda_kernel_launch(qfix_matched_mmvq_control<type, c_ncols_dst, false, small_k>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x,
+                stride_col_y, stride_col_dst, channel_ratio, stride_channel_x,
+                stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x,
+                stride_sample_y, stride_sample_dst, ids_stride);
+        } else {
+            ggml_cuda_kernel_launch(qfix_matched_mmvq_control<type, c_ncols_dst, true, small_k>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x,
+                stride_col_y, stride_col_dst, channel_ratio, stride_channel_x,
+                stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x,
+                stride_sample_y, stride_sample_dst, ids_stride);
+        }
+        return;
+    }
     if constexpr (c_ncols_dst == 2 && type == GGML_TYPE_IQ4_NL) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const bool supported_fusion =
@@ -1089,19 +1176,19 @@ static void mul_mat_vec_q_switch_fusion(
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, 2>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
                             return;
                         case 4:
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, 4>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
                             return;
                         case 8:
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, 8>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
                             return;
                         default:
                             break;
@@ -1112,19 +1199,19 @@ static void mul_mat_vec_q_switch_fusion(
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 2>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
                             return;
                         case 4:
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 4>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
                             return;
                         case 8:
                             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, 8>, launch_params,
                                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
                             return;
                         default:
                             break;
@@ -1137,7 +1224,7 @@ static void mul_mat_vec_q_switch_fusion(
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
             return;
         }
     }
@@ -1148,7 +1235,7 @@ static void mul_mat_vec_q_switch_fusion(
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, qfix_phase);
 }
 
 template <ggml_type type>
@@ -1582,7 +1669,8 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const int qfix_mode = get_qfix_decompose_mode();
+    if (qfix_mode != 2 && qfix_mode != 3 && qfix_mode != 4 && qfix_mode != 5) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -1611,11 +1699,13 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    if (qfix_mode != 1 && qfix_mode != 3) {
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+            ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
