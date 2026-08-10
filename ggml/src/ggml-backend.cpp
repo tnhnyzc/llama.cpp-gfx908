@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
+#include <cinttypes>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1551,6 +1553,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const bool mixed_profile = getenv("GGML_MIXED_PROFILE") != nullptr;
+    const bool mixed_profile_sync = getenv("GGML_MIXED_PROFILE_SYNC") != nullptr;
+    static uint64_t mixed_profile_graph = 0;
+    static bool mixed_profile_detail_done = false;
+    const uint64_t profile_graph = mixed_profile ? ++mixed_profile_graph : 0;
+    const bool profile_detail = mixed_profile && sched->n_splits > 1 && !mixed_profile_detail_done;
+    const auto profile_begin = std::chrono::steady_clock::now();
+    int profile_splits_cuda = 0;
+    int profile_splits_rocm = 0;
+    int profile_splits_cpu  = 0;
+    int profile_expert_tensors = 0;
+    int profile_expert_ranges  = 0;
+    int profile_ids_reads      = 0;
+    size_t profile_expert_bytes = 0;
+    int64_t profile_wait_us    = 0;
+    int64_t profile_ids_us     = 0;
+    int64_t profile_set_us     = 0;
+    int64_t profile_enqueue_us = 0;
+    int64_t profile_cuda_us    = 0;
+    int64_t profile_rocm_us    = 0;
+    int64_t profile_cpu_us     = 0;
+    size_t profile_cross_bytes = 0;
+
+    auto profile_elapsed_us = [](const auto & begin) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+    };
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1559,12 +1589,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const auto split_begin = std::chrono::steady_clock::now();
+        const char * split_backend_name = ggml_backend_name(split_backend);
+
+        if (mixed_profile) {
+            const char * backend_name = split_backend_name;
+            profile_splits_cuda += strstr(backend_name, "CUDA") != nullptr;
+            profile_splits_rocm += strstr(backend_name, "ROCm") != nullptr;
+            profile_splits_cpu  += strstr(backend_name, "CPU")  != nullptr;
+
+            if (profile_detail && split->graph.n_nodes > 0) {
+                const ggml_tensor * first = split->graph.nodes[0];
+                const ggml_tensor * last  = split->graph.nodes[split->graph.n_nodes - 1];
+                GGML_LOG_INFO("MIXSPLIT graph=%" PRIu64 " split=%d backend=%s nodes=%d inputs=%d "
+                        "first_op=%s first=%s last_op=%s last=%s\n",
+                        profile_graph, split_id, backend_name, split->graph.n_nodes, split->n_inputs,
+                        ggml_op_desc(first), first->name, ggml_op_desc(last), last->name);
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            if (mixed_profile && input_backend != split_backend) {
+                profile_cross_bytes += ggml_nbytes(input);
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1576,10 +1628,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                const auto wait_begin = std::chrono::steady_clock::now();
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                }
+                if (mixed_profile) {
+                    profile_wait_us += profile_elapsed_us(wait_begin);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1593,6 +1649,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    if (mixed_profile) {
+                        profile_expert_tensors++;
+                    }
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1611,9 +1671,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        const auto ids_begin = std::chrono::steady_clock::now();
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+
+                        if (mixed_profile) {
+                            profile_ids_reads++;
+                            profile_ids_us += profile_elapsed_us(ids_begin);
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1636,12 +1702,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        const auto set_begin = std::chrono::steady_clock::now();
+
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+
+                        if (mixed_profile) {
+                            profile_expert_ranges++;
+                            profile_expert_bytes += expert_size_copy + padding_end;
+                            profile_set_us += profile_elapsed_us(set_begin);
+                        }
                     };
 
                     int id = 0;
@@ -1684,7 +1758,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const auto enqueue_begin = std::chrono::steady_clock::now();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (mixed_profile) {
+                profile_enqueue_us += profile_elapsed_us(enqueue_begin);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1728,6 +1806,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+
+        if (mixed_profile_sync) {
+            ggml_backend_synchronize(split_backend);
+            const int64_t split_us = profile_elapsed_us(split_begin);
+            profile_cuda_us += strstr(split_backend_name, "CUDA") != nullptr ? split_us : 0;
+            profile_rocm_us += strstr(split_backend_name, "ROCm") != nullptr ? split_us : 0;
+            profile_cpu_us  += strstr(split_backend_name, "CPU")  != nullptr ? split_us : 0;
+        }
+    }
+
+    if (mixed_profile && (sched->n_splits > 1 || profile_expert_tensors > 0 || profile_graph <= 8 || profile_graph % 32 == 0)) {
+        GGML_LOG_INFO("MIXPROF graph=%" PRIu64 " splits=%d cuda=%d rocm=%d cpu=%d expert_tensors=%d "
+                "expert_ranges=%d expert_MiB=%.2f ids_reads=%d wall_us=%" PRId64 " wait_us=%" PRId64
+                " ids_us=%" PRId64 " set_us=%" PRId64 " enqueue_us=%" PRId64
+                " sync=%d cuda_us=%" PRId64 " rocm_us=%" PRId64 " cpu_us=%" PRId64 " cross_MiB=%.3f\n",
+                profile_graph, sched->n_splits, profile_splits_cuda, profile_splits_rocm, profile_splits_cpu,
+                profile_expert_tensors, profile_expert_ranges, profile_expert_bytes/(1024.0*1024.0),
+                profile_ids_reads, profile_elapsed_us(profile_begin), profile_wait_us, profile_ids_us,
+                profile_set_us, profile_enqueue_us, mixed_profile_sync ? 1 : 0,
+                profile_cuda_us, profile_rocm_us, profile_cpu_us, profile_cross_bytes/(1024.0*1024.0));
+    }
+    if (profile_detail) {
+        mixed_profile_detail_done = true;
     }
 
     return GGML_STATUS_SUCCESS;
