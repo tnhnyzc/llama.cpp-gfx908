@@ -706,6 +706,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    ggml_cuda_set_device(device);
+    for (const auto & [leader, scratch] : recurrent_mmvf_pair_scratch) {
+        GGML_UNUSED(leader);
+        CUDA_CHECK(cudaFree(scratch));
+    }
+    recurrent_mmvf_pair_scratch.clear();
+    recurrent_mmvf_pair_leaders.clear();
+    recurrent_mmvf_pair_followers.clear();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2292,6 +2301,88 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q_gfx908_m2(const ggml_tensor * te
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
 
+static bool ggml_cuda_recurrent_mmvf_pair_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_RECURRENT_MMVF_PAIR_GFX908");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_recurrent_mmvf_pair_candidate(const ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * weight = node->src[0];
+    const ggml_tensor * input = node->src[1];
+    return weight->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+           weight->ne[0] == 5120 && weight->ne[1] == 48 && ggml_nelements(weight) == 5120 * 48 &&
+           input->ne[0] == 5120 && ggml_nelements(input) == 5120 &&
+           node->ne[0] == 48 && ggml_nelements(node) == 48 &&
+           ggml_is_contiguous(weight) && ggml_is_contiguous(input) && ggml_is_contiguous(node) &&
+           ggml_cuda_should_fuse_mul_mat_vec_f(node);
+}
+
+static void ggml_cuda_prepare_recurrent_mmvf_pairs(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph) {
+    cuda_ctx->recurrent_mmvf_pair_leaders.clear();
+    cuda_ctx->recurrent_mmvf_pair_followers.clear();
+    if (!ggml_cuda_recurrent_mmvf_pair_enabled() ||
+            ggml_cuda_info().devices[cuda_ctx->device].cc != GGML_CUDA_CC_CDNA1) {
+        return;
+    }
+
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> by_input;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_recurrent_mmvf_pair_candidate(node)) {
+            by_input[node->src[1]].push_back(node);
+        }
+    }
+
+    int selected_pairs = 0;
+    int rejected_groups = 0;
+    int allocations_new = 0;
+    for (const auto & [input, nodes] : by_input) {
+        GGML_UNUSED(input);
+        if (nodes.size() != 2 || nodes[0]->src[0] == nodes[1]->src[0]) {
+            ++rejected_groups;
+            continue;
+        }
+
+        ggml_tensor * leader = nodes[0];
+        ggml_tensor * follower = nodes[1];
+        void * scratch = nullptr;
+        const auto allocation = cuda_ctx->recurrent_mmvf_pair_scratch.find(leader);
+        if (allocation == cuda_ctx->recurrent_mmvf_pair_scratch.end()) {
+            CUDA_CHECK(cudaMalloc(&scratch, ggml_nbytes(follower)));
+            cuda_ctx->recurrent_mmvf_pair_scratch.emplace(leader, scratch);
+            ++allocations_new;
+        } else {
+            scratch = allocation->second;
+        }
+
+        cuda_ctx->recurrent_mmvf_pair_leaders.emplace(
+            leader, ggml_cuda_recurrent_mmvf_pair{follower->src[0], scratch});
+        cuda_ctx->recurrent_mmvf_pair_followers.emplace(follower, scratch);
+        ++selected_pairs;
+    }
+
+    static uint64_t census_sequence = 0;
+    static const bool census = [] {
+        const char * env = getenv("GGML_HIP_RECURRENT_MMVF_PAIR_CENSUS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (census && census_sequence++ < 16) {
+        std::fprintf(stderr,
+            "RECURRENT_MMVF_PAIR_CENSUS\tselected_pairs=%d\trejected_groups=%d\tallocations_new=%d\tallocations_total=%zu\n",
+            selected_pairs, rejected_groups, allocations_new, cuda_ctx->recurrent_mmvf_pair_scratch.size());
+    }
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2701,9 +2792,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_RMS_NORM_BACK:
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
-        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT: {
+            const auto leader = ctx.recurrent_mmvf_pair_leaders.find(dst);
+            if (leader != ctx.recurrent_mmvf_pair_leaders.end()) {
+                ggml_cuda_mul_mat_vec_f_recurrent_pair(
+                    ctx, dst->src[0], leader->second.second_weight, dst->src[1], dst, leader->second.second_scratch);
+                break;
+            }
+            const auto follower = ctx.recurrent_mmvf_pair_followers.find(dst);
+            if (follower != ctx.recurrent_mmvf_pair_followers.end()) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dst->data, follower->second, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+                break;
+            }
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
-            break;
+        } break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -3673,6 +3776,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // The paired leader stores the second exact MMVF result in stable scratch.
+    // At the follower's normal graph position, preserve the existing
+    // MUL_MAT+ADD fusion contract with one tiny scratch+bias kernel.
+    const auto recurrent_follower = cuda_ctx->recurrent_mmvf_pair_followers.find(node);
+    if (recurrent_follower != cuda_ctx->recurrent_mmvf_pair_followers.end() &&
+            i + 1 < cgraph->n_nodes && ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        const ggml_tensor * bias = nullptr;
+        if (add->src[0] == node) {
+            bias = add->src[1];
+        } else if (add->src[1] == node) {
+            bias = add->src[0];
+        }
+        if (bias != nullptr && bias->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(bias, add) && ggml_nelements(add) == 48 &&
+                ggml_is_contiguous(bias) && ggml_is_contiguous(add)) {
+            ggml_cuda_recurrent_mmvf_pair_add(*cuda_ctx, recurrent_follower->second, bias, add);
+            return 1;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -4627,6 +4751,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_prepare_recurrent_mmvf_pairs(cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
