@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -429,8 +431,54 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    // Q and K are adjacent, identically shaped slices of conv_qkv_mix, and
+    // ggml_l2_norm normalises each row of head_k_dim independently. Normalising
+    // them together as one tensor of 2*num_k_heads rows is therefore
+    // arithmetically identical to two separate calls, at one kernel launch
+    // instead of two.
+    //
+    // Worth doing because these launches are almost entirely fixed cost. At
+    // decode a single l2_norm here moves a few KB but takes ~4 us, so merging
+    // the work is free and deleting the launch is the whole saving. The pair
+    // fires once per linear-attention layer -- 48 times per token for this
+    // model.
+    //
+    // The split views have packed rows, which is all that
+    // ggml_is_contiguous_rows requires -- the assertion the gated-delta-net op
+    // actually makes on q and k. Full contiguity is neither needed nor
+    // provided, since a K-sized gap sits between successive token slices.
+    //
+    // The gfx908 Q/K-scale -> GDN experiment also needs a single producer
+    // tensor so the backend can retain only the per-head scales and let GDN
+    // reconstruct the exact normalized f32 values at its load boundary.
+    // Keep the topology opt-in so one binary provides a matched control.
+    static const bool fused_qk_l2norm = []() {
+        const char * e = getenv("GGML_HIP_QK_L2_GDN_SCALE_ISLAND_GFX908");
+        return e != nullptr && atoi(e) != 0;
+    }();
+
+    if (fused_qk_l2norm) {
+        ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix,
+                head_k_dim, num_k_heads * 2, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                0);
+
+        qk_conv = ggml_l2_norm(ctx0, qk_conv, eps_norm);
+        cb(qk_conv, "qk_conv_l2", il);
+
+        q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3],
+                0);
+
+        k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3],
+                num_k_heads * qk_conv->nb[1]);
+    } else {
+        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);

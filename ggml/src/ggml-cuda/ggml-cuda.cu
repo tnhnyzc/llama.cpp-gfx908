@@ -2512,6 +2512,109 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+static bool ggml_cuda_qk_l2_gdn_scale_island_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_QK_L2_GDN_SCALE_ISLAND_GFX908");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_prepare_qk_l2_gdn_scale_islands(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cgraph * cgraph) {
+    cuda_ctx->qk_l2_gdn_scale_producers.clear();
+    cuda_ctx->qk_l2_gdn_scale_consumers.clear();
+
+    if (!ggml_cuda_qk_l2_gdn_scale_island_enabled() ||
+            ggml_cuda_info().devices[cuda_ctx->device].cc != GGML_CUDA_CC_CDNA1) {
+        return;
+    }
+
+    int selected = 0;
+    int rejected_shape = 0;
+    int rejected_alias = 0;
+    int rejected_fanout = 0;
+
+    // Attribute all direct consumers once. A per-candidate graph rescan is
+    // measurable at B1 and can erase the device-side saving before replay.
+    std::unordered_map<const ggml_tensor *, int> fanout;
+    fanout.reserve((size_t) cgraph->n_nodes * 2);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * consumer = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (consumer->src[s] != nullptr) {
+                ++fanout[consumer->src[s]];
+            }
+        }
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * gdn = cgraph->nodes[i];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+                gdn->src[0] == nullptr || gdn->src[1] == nullptr || gdn->src[2] == nullptr) {
+            continue;
+        }
+
+        const ggml_tensor * q = gdn->src[0];
+        const ggml_tensor * k = gdn->src[1];
+        const ggml_tensor * v = gdn->src[2];
+        const ggml_tensor * qk_l2 = q->view_src;
+        if (q->op != GGML_OP_VIEW || k->op != GGML_OP_VIEW || qk_l2 == nullptr ||
+                k->view_src != qk_l2 || qk_l2->op != GGML_OP_L2_NORM || qk_l2->src[0] == nullptr) {
+            ++rejected_alias;
+            continue;
+        }
+
+        const ggml_tensor * raw_qk = qk_l2->src[0];
+        const bool exact_shape =
+            q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && raw_qk->type == GGML_TYPE_F32 &&
+            q->ne[0] == 128 && q->ne[1] == 16 && q->ne[2] == 1 && q->ne[3] == 1 &&
+            ggml_are_same_shape(q, k) &&
+            qk_l2->ne[0] == 128 && qk_l2->ne[1] == 32 && qk_l2->ne[2] == 1 && qk_l2->ne[3] == 1 &&
+            ggml_are_same_shape(qk_l2, raw_qk) &&
+            v->type == GGML_TYPE_F32 && v->ne[0] == 128 && v->ne[1] == 48 && v->ne[2] == 1 && v->ne[3] == 1 &&
+            q->view_offs == 0 && k->view_offs == 16 * qk_l2->nb[1] &&
+            qk_l2->nb[1] == ggml_row_size(GGML_TYPE_F32, 128) &&
+            raw_qk->nb[0] == sizeof(float) && raw_qk->nb[1] == qk_l2->nb[1] &&
+            ggml_is_contiguous_rows(raw_qk) && ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k);
+        if (!exact_shape) {
+            ++rejected_shape;
+            continue;
+        }
+
+        const int q_uses = fanout[q];
+        const int k_uses = fanout[k];
+        if (q_uses != 1 || k_uses != 1 ||
+                cuda_ctx->qk_l2_gdn_scale_producers.find(qk_l2) !=
+                    cuda_ctx->qk_l2_gdn_scale_producers.end()) {
+            ++rejected_fanout;
+            continue;
+        }
+
+        const ggml_cuda_qk_l2_gdn_scale_island island = {
+            qk_l2, raw_qk, q->view_offs, k->view_offs
+        };
+        cuda_ctx->qk_l2_gdn_scale_producers.emplace(qk_l2, island);
+        cuda_ctx->qk_l2_gdn_scale_consumers.emplace(gdn, island);
+        ++selected;
+    }
+
+    static uint64_t census_sequence = 0;
+    static const bool census = [] {
+        const char * env = getenv("GGML_HIP_QK_L2_GDN_SCALE_ISLAND_CENSUS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (census && census_sequence++ < 16) {
+        std::fprintf(stderr,
+            "QK_L2_GDN_SCALE_ISLAND_CENSUS\tselected=%d\tproducers=%zu\tconsumers=%zu"
+            "\trejected_shape=%d\trejected_alias=%d\trejected_fanout=%d\n",
+            selected, cuda_ctx->qk_l2_gdn_scale_producers.size(),
+            cuda_ctx->qk_l2_gdn_scale_consumers.size(), rejected_shape,
+            rejected_alias, rejected_fanout);
+    }
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -2669,7 +2772,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_group_norm(ctx, dst);
             break;
         case GGML_OP_L2_NORM:
-            ggml_cuda_op_l2_norm(ctx, dst);
+            if (ctx.qk_l2_gdn_scale_producers.find(dst) != ctx.qk_l2_gdn_scale_producers.end()) {
+                ggml_cuda_op_l2_norm_scales(ctx, dst);
+            } else {
+                ggml_cuda_op_l2_norm(ctx, dst);
+            }
             break;
         case GGML_OP_CONCAT:
             ggml_cuda_op_concat(ctx, dst);
@@ -4627,6 +4734,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_prepare_qk_l2_gdn_scale_islands(cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

@@ -277,6 +277,35 @@ static __global__ void l2_norm_f32(
     }
 }
 
+template <int block_size>
+static __global__ void l2_norm_scales_f32(
+        const float * x, float * scales, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x += sample*stride_sample + channel*stride_channel + row*stride_row;
+
+    float tmp = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    if (tid == 0) {
+        scales[(sample*nchannels + channel)*nrows + row] = rsqrtf(fmaxf(tmp, eps * eps));
+    }
+}
+
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -695,4 +724,31 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_l2_norm_scales(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    float * scales_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_TENSOR_UNARY_OP_LOCALS;
+    GGML_ASSERT(ne00 == 128 && ne01 == 32 && ne02 == 1 && ne03 == 1);
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    const dim3 blocks_num(ne01, ne02, ne03);
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(l2_norm_scales_f32<WARP_SIZE>, launch_params,
+        src0_d, scales_d, ne00, s01, s02, s03, eps);
 }

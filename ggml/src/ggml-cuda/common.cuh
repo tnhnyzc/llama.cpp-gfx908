@@ -1489,6 +1489,13 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_qk_l2_gdn_scale_island {
+    const ggml_tensor * qk_l2 = nullptr;
+    const ggml_tensor * raw_qk = nullptr;
+    size_t q_offset = 0;
+    size_t k_offset = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1498,6 +1505,12 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+
+    // Populated once per graph execution only for the exact gfx908 B1
+    // Qwen3.5/Qwen3.6 Q/K L2 -> GDN chain. The L2 destination itself holds
+    // the 32 per-head scales, so no extra graph-unsafe allocation is needed.
+    std::unordered_map<const ggml_tensor *, ggml_cuda_qk_l2_gdn_scale_island> qk_l2_gdn_scale_producers;
+    std::unordered_map<const ggml_tensor *, ggml_cuda_qk_l2_gdn_scale_island> qk_l2_gdn_scale_consumers;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1743,4 +1756,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
