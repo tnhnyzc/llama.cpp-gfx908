@@ -1955,6 +1955,47 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
 
+ggml_backend_dev_t llama_model::dev_layer_affinity(int il) const {
+    const auto direct_device = [](const ggml_tensor * tensor) -> ggml_backend_dev_t {
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return nullptr;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        ggml_backend_dev_t          dev  = ggml_backend_buft_get_device(buft);
+
+        // A split buffer represents multiple devices and must keep using the
+        // coarse layer assignment. Only follow a direct device buffer here.
+        if (dev != nullptr && buft == ggml_backend_dev_buffer_type(dev)) {
+            return dev;
+        }
+
+        return nullptr;
+    };
+
+    const auto & layer = layers.at(il);
+
+    // The output projection is the best layer-affinity anchor: the attention
+    // result is consumed by it immediately. Fall back through the common
+    // self-attention projection layouts used by fused and MLA models.
+    const ggml_tensor * const attention_anchors[] = {
+        layer.wo,
+        layer.wq,
+        layer.wqkv,
+        layer.wq_a,
+        layer.wkv_a_mqa,
+        layer.wkv,
+    };
+
+    for (const ggml_tensor * anchor : attention_anchors) {
+        if (ggml_backend_dev_t dev = direct_device(anchor)) {
+            return dev;
+        }
+    }
+
+    return dev_layer(il);
+}
+
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
 }

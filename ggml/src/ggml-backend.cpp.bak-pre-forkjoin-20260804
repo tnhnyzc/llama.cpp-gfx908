@@ -21,10 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
-#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -774,85 +770,6 @@ struct ggml_backend_sched_split {
     int n_inputs;
     // graph view of this split
     struct ggml_cgraph graph;
-    // A synchronous host split can overlap the following accelerator fork.
-    bool overlap_with_next;
-    // Join the pending host split before preparing this split's inputs.
-    bool wait_for_host;
-};
-
-struct ggml_backend_sched_host_executor {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::thread worker;
-    bool stop = false;
-    bool pending = false;
-    bool queued = false;
-    bool running = false;
-    int wait_split_id = -1;
-    enum ggml_status status = GGML_STATUS_SUCCESS;
-    ggml_backend_t backend = nullptr;
-    struct ggml_cgraph graph = {};
-
-    ~ggml_backend_sched_host_executor() {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            stop = true;
-            cv.notify_all();
-        }
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-
-    void ensure_started() {
-        if (worker.joinable()) {
-            return;
-        }
-        worker = std::thread([this]() {
-            std::unique_lock<std::mutex> lock(mutex);
-            while (true) {
-                cv.wait(lock, [this]() { return stop || queued; });
-                if (stop) {
-                    return;
-                }
-                ggml_backend_t current_backend = backend;
-                struct ggml_cgraph current_graph = graph;
-                queued = false;
-                running = true;
-                lock.unlock();
-                const enum ggml_status ec = ggml_backend_graph_compute_async(current_backend, &current_graph);
-                lock.lock();
-                status = ec;
-                running = false;
-                cv.notify_all();
-            }
-        });
-    }
-
-    void submit(ggml_backend_t new_backend, const struct ggml_cgraph & new_graph, int new_wait_split_id) {
-        ensure_started();
-        std::lock_guard<std::mutex> lock(mutex);
-        GGML_ASSERT(!pending && !queued && !running);
-        backend = new_backend;
-        graph = new_graph;
-        wait_split_id = new_wait_split_id;
-        status = GGML_STATUS_SUCCESS;
-        pending = true;
-        queued = true;
-        cv.notify_all();
-    }
-
-    bool active() {
-        std::lock_guard<std::mutex> lock(mutex);
-        return pending;
-    }
-
-    enum ggml_status wait() {
-        std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [this]() { return !queued && !running; });
-        pending = false;
-        return status;
-    }
 };
 
 struct ggml_backend_sched_copy_profile {
@@ -1526,94 +1443,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
-    // Expose host/accelerator fork-join structure before creating backend
-    // splits. A common MoE graph shape computes routed experts on the host,
-    // while an independent shared-expert branch is already assigned to an
-    // accelerator. Stable-partitioning the accelerator run keeps the graph
-    // topological, and gives the scheduler real subgraphs with native
-    // allocation and backend metadata instead of synthetic filtered views.
-    std::unordered_set<struct ggml_tensor *> fork_join_boundaries;
-    {
-        struct backend_run {
-            int i_start;
-            int i_end;
-            int backend_id;
-        };
-        std::vector<backend_run> runs;
-
-        int run_start = 0;
-        int run_backend_id = -1;
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            struct ggml_tensor * node = graph->nodes[i];
-            if (ggml_is_view_op(node->op)) {
-                continue;
-            }
-            const int backend_id = tensor_backend_id(node);
-            if (run_backend_id == -1) {
-                run_backend_id = backend_id;
-            } else if (backend_id != run_backend_id) {
-                runs.push_back({run_start, i, run_backend_id});
-                run_start = i;
-                run_backend_id = backend_id;
-            }
-        }
-        if (run_backend_id != -1) {
-            runs.push_back({run_start, graph->n_nodes, run_backend_id});
-        }
-
-        const int host_backend_id = sched->n_backends - 1;
-        for (size_t run_id = 0; run_id + 1 < runs.size(); ++run_id) {
-            const backend_run & producer = runs[run_id];
-            const backend_run & consumer = runs[run_id + 1];
-            if (producer.backend_id != host_backend_id || consumer.backend_id == host_backend_id) {
-                continue;
-            }
-
-            std::unordered_set<struct ggml_tensor *> depends_on_host;
-            for (int i = producer.i_start; i < producer.i_end; ++i) {
-                depends_on_host.insert(graph->nodes[i]);
-            }
-
-            auto tensor_depends_on_host = [&](struct ggml_tensor * tensor) {
-                for (struct ggml_tensor * current = tensor; current != nullptr; current = current->view_src) {
-                    if (depends_on_host.count(current) != 0) {
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            std::vector<struct ggml_tensor *> independent;
-            std::vector<struct ggml_tensor *> dependent;
-            for (int i = consumer.i_start; i < consumer.i_end; ++i) {
-                struct ggml_tensor * node = graph->nodes[i];
-                bool is_dependent = tensor_depends_on_host(node->view_src);
-                for (int src_id = 0; !is_dependent && src_id < GGML_MAX_SRC; ++src_id) {
-                    is_dependent = tensor_depends_on_host(node->src[src_id]);
-                }
-                if (is_dependent) {
-                    depends_on_host.insert(node);
-                    dependent.push_back(node);
-                } else {
-                    independent.push_back(node);
-                }
-            }
-
-            if (independent.empty() || dependent.empty()) {
-                continue;
-            }
-
-            int dst = consumer.i_start;
-            for (struct ggml_tensor * node : independent) {
-                graph->nodes[dst++] = node;
-            }
-            for (struct ggml_tensor * node : dependent) {
-                graph->nodes[dst++] = node;
-            }
-            fork_join_boundaries.insert(dependent.front());
-        }
-    }
-
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
@@ -1629,8 +1458,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
-        split->overlap_with_next = false;
-        split->wait_for_host = false;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1644,7 +1471,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
             // check if we should start a new split based on the sources of the current node
-            bool need_new_split = fork_join_boundaries.count(node) != 0 && i > split->i_start;
+            bool need_new_split = false;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1687,8 +1514,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
-                split->overlap_with_next = false;
-                split->wait_for_host = false;
                 cur_backend_id = node_backend_id;
             }
 
@@ -1749,36 +1574,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
-
-        // Mark only verified CPU -> independent accelerator -> dependent
-        // accelerator triples. If the independent split still needs a CPU
-        // input, leave execution serial to avoid concurrent use of the host
-        // backend during input preparation.
-        const int host_backend_id = sched->n_backends - 1;
-        for (int split_id = 0; split_id + 2 < sched->n_splits; ++split_id) {
-            struct ggml_backend_sched_split * host = &sched->splits[split_id];
-            struct ggml_backend_sched_split * fork = &sched->splits[split_id + 1];
-            struct ggml_backend_sched_split * join = &sched->splits[split_id + 2];
-            if (host->backend_id != host_backend_id ||
-                fork->backend_id == host_backend_id ||
-                join->backend_id != fork->backend_id ||
-                fork_join_boundaries.count(graph->nodes[join->i_start]) == 0) {
-                continue;
-            }
-
-            bool fork_uses_host = false;
-            for (int input_id = 0; input_id < fork->n_inputs; ++input_id) {
-                ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, fork->inputs[input_id]);
-                if (ggml_backend_sched_backend_id(sched, input_backend) == host_backend_id) {
-                    fork_uses_host = true;
-                    break;
-                }
-            }
-            if (!fork_uses_host) {
-                host->overlap_with_next = true;
-                join->wait_for_host = true;
-            }
-        }
     }
 
     if (sched->debug) {
@@ -1978,21 +1773,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
     std::vector<staged_copy> staged_copies;
 
-    ggml_backend_sched_host_executor host_executor;
-
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         staged_copies.clear();
-
-        if (host_executor.active() && split->wait_for_host) {
-            GGML_ASSERT(split_id == host_executor.wait_split_id);
-            const enum ggml_status ec = host_executor.wait();
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
-            }
-        }
 
         if (copy_trace) {
             const struct ggml_tensor * first = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
@@ -2345,14 +2130,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (!sched->callback_eval && split->overlap_with_next) {
-            GGML_ASSERT(!host_executor.active());
-            GGML_ASSERT(split_id + 2 < sched->n_splits);
-            host_executor.submit(split_backend, split->graph, split_id + 2);
-        } else if (!sched->callback_eval) {
+        if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
-                host_executor.wait();
                 return ec;
             }
         } else {
@@ -2394,13 +2174,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
-        }
-    }
-
-    {
-        const enum ggml_status ec = host_executor.wait();
-        if (ec != GGML_STATUS_SUCCESS) {
-            return ec;
         }
     }
 
