@@ -1499,6 +1499,11 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Experimental gfx908 mixed-consumer RMS/MUL side representation.
+    // The F32 tensor remains live for MMVF consumers while this stable allocation
+    // holds one q8_1 row shared by the two MMVQ consumers.
+    std::unordered_map<const ggml_tensor *, void *> mixed_norm_q8_1_inputs;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1743,4 +1748,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

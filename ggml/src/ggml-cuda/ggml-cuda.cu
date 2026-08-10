@@ -706,6 +706,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    ggml_cuda_set_device(device);
+    for (const auto & [tensor, ptr] : mixed_norm_q8_1_inputs) {
+        GGML_UNUSED(tensor);
+        CUDA_CHECK(cudaFree(ptr));
+    }
+    mixed_norm_q8_1_inputs.clear();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -3664,6 +3671,185 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+struct ggml_cuda_mixed_norm_q8_counts {
+    int q8_consumers = 0;
+    int f32_consumers = 0;
+};
+
+static bool ggml_cuda_mixed_norm_q8_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_MIXED_NORM_Q8_GFX908");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_norm_fanout_census(const ggml_cgraph * cgraph) {
+    static bool done = false;
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_NORM_FANOUT_CENSUS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enabled || done) {
+        return;
+    }
+    done = true;
+
+    int producers = 0;
+    int direct_q8_safe = 0;
+    int retained = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * rms_norm = cgraph->nodes[i];
+        if (rms_norm->op != GGML_OP_RMS_NORM || rms_norm->type != GGML_TYPE_F32) {
+            continue;
+        }
+
+        const ggml_tensor * output = rms_norm;
+        bool paired_mul = false;
+        if (i + 1 < cgraph->n_nodes) {
+            const ggml_tensor * mul = cgraph->nodes[i + 1];
+            paired_mul = mul->op == GGML_OP_MUL && (mul->src[0] == rms_norm || mul->src[1] == rms_norm) &&
+                    mul->type == GGML_TYPE_F32 && ggml_are_same_shape(rms_norm, mul);
+            if (paired_mul) {
+                output = mul;
+            }
+        }
+
+        int consumers = 0;
+        int q8_consumers = 0;
+        int f32_consumers = 0;
+        std::fprintf(stderr,
+            "NORM_FANOUT\trms_idx=%d\trms_ne0=%lld\trms_rows=%lld\tpaired_mul=%d\tproducer_name=%s",
+            i, (long long) rms_norm->ne[0], (long long) ggml_nrows(rms_norm), paired_mul ? 1 : 0, output->name);
+        for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
+            const ggml_tensor * node = cgraph->nodes[node_idx];
+            for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                if (node->src[source] != output || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+                const bool q8 = source == 1 && node->op == GGML_OP_MUL_MAT &&
+                        ggml_cuda_should_fuse_mul_mat_vec_q(node);
+                q8_consumers += q8 ? 1 : 0;
+                f32_consumers += q8 ? 0 : 1;
+                std::fprintf(stderr,
+                    "\tconsumer%d_idx=%d\tconsumer%d_src=%d\tconsumer%d_q8=%d\tconsumer%d_op=%s\tconsumer%d_name=%s",
+                    consumers, node_idx, consumers, source, consumers, q8 ? 1 : 0,
+                    consumers, ggml_op_name(node->op), consumers, node->name);
+                ++consumers;
+            }
+        }
+        const bool exact_direct_shape = rms_norm->ne[0] == 5120 && ggml_nelements(rms_norm) == 5120 &&
+                ggml_is_contiguous(rms_norm) && output->ne[0] == 5120 && ggml_nelements(output) == 5120 &&
+                ggml_is_contiguous(output);
+        const bool safe = exact_direct_shape && paired_mul && q8_consumers > 0 && f32_consumers == 0;
+        direct_q8_safe += safe ? 1 : 0;
+        retained += safe ? 0 : 1;
+        std::fprintf(stderr,
+            "\tconsumers=%d\tq8_consumers=%d\tf32_consumers=%d\tdirect_q8_safe=%d\n",
+            consumers, q8_consumers, f32_consumers, safe ? 1 : 0);
+        ++producers;
+    }
+    std::fprintf(stderr,
+        "NORM_FANOUT_SUMMARY\tproducers=%d\tdirect_q8_safe=%d\tretained=%d\n",
+        producers, direct_q8_safe, retained);
+}
+
+static ggml_cuda_mixed_norm_q8_counts ggml_cuda_mixed_norm_q8_consumers(
+        const ggml_cgraph * cgraph, const ggml_tensor * input) {
+    ggml_cuda_mixed_norm_q8_counts counts;
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            if (node->src[source] != input || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                continue;
+            }
+            if (source == 1 && node->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+                ++counts.q8_consumers;
+            } else {
+                ++counts.f32_consumers;
+            }
+        }
+    }
+    return counts;
+}
+
+static bool ggml_cuda_mixed_norm_q8_eligible(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_mixed_norm_q8_counts * counts_out = nullptr) {
+    if (!ggml_cuda_mixed_norm_q8_enabled() ||
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_CDNA1 ||
+            node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return false;
+    }
+
+    const ggml_tensor * input = rms_norm->src[0];
+    const ggml_tensor * scale = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (input->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            input->ne[0] != 5120 || ggml_nelements(input) != 5120 ||
+            !ggml_are_same_shape(input, scale) || !ggml_are_same_shape(input, mul) ||
+            !ggml_is_contiguous(input) || !ggml_is_contiguous(scale) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    const ggml_cuda_mixed_norm_q8_counts counts = ggml_cuda_mixed_norm_q8_consumers(cgraph, mul);
+    if (counts_out != nullptr) {
+        *counts_out = counts;
+    }
+    return counts.q8_consumers == 2 && counts.f32_consumers >= 1;
+}
+
+static void ggml_cuda_prepare_mixed_norm_q8(
+        ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    if (!ggml_cuda_mixed_norm_q8_enabled() ||
+            ggml_cuda_info().devices[cuda_ctx->device].cc != GGML_CUDA_CC_CDNA1) {
+        return;
+    }
+
+    int selected = 0;
+    int q8_consumers = 0;
+    int f32_consumers = 0;
+    int allocations_new = 0;
+    for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+        ggml_cuda_mixed_norm_q8_counts counts;
+        if (!ggml_cuda_mixed_norm_q8_eligible(cgraph, i, &counts)) {
+            continue;
+        }
+
+        const ggml_tensor * mul = cgraph->nodes[i + 1];
+        ++selected;
+        q8_consumers += counts.q8_consumers;
+        f32_consumers += counts.f32_consumers;
+        if (cuda_ctx->mixed_norm_q8_1_inputs.find(mul) != cuda_ctx->mixed_norm_q8_1_inputs.end()) {
+            continue;
+        }
+
+        const size_t q8_size = GGML_PAD(mul->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1;
+        void * storage = nullptr;
+        CUDA_CHECK(cudaMalloc(&storage, q8_size + sizeof(float)));
+        cuda_ctx->mixed_norm_q8_1_inputs.emplace(mul, storage);
+        ++allocations_new;
+    }
+
+    static uint64_t census_sequence = 0;
+    static const bool census = [] {
+        const char * env = getenv("GGML_HIP_MIXED_NORM_Q8_CENSUS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (census && census_sequence++ < 8) {
+        std::fprintf(stderr,
+            "MIXED_NORM_Q8_CENSUS\tselected=%d\tq8_consumers=%d\tf32_consumers=%d\tallocations_new=%d\tallocations_total=%zu\n",
+            selected, q8_consumers, f32_consumers, allocations_new, cuda_ctx->mixed_norm_q8_1_inputs.size());
+    }
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4358,6 +4544,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const auto mixed_q8 = cuda_ctx->mixed_norm_q8_1_inputs.find(mul);
+        if (mixed_q8 != cuda_ctx->mixed_norm_q8_1_inputs.end()) {
+            ggml_cuda_op_rms_norm_fused_dual_q8_1(*cuda_ctx, node, mul, mixed_q8->second);
+            return 1;
+        }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
@@ -4580,6 +4772,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
+            static const bool mixed_q8_census = [] {
+                const char * env = getenv("GGML_HIP_MIXED_NORM_Q8_CENSUS");
+                return env != nullptr && atoi(env) != 0;
+            }();
+            if (mixed_q8_census) {
+                size_t captured_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &captured_nodes));
+                std::fprintf(stderr, "MIXED_NORM_Q8_GRAPH\tcaptured_nodes=%zu\n", captured_nodes);
+            }
+
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
@@ -4627,6 +4829,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_norm_fanout_census(cgraph);
+    ggml_cuda_prepare_mixed_norm_q8(cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
