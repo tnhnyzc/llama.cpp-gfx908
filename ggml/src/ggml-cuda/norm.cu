@@ -155,6 +155,65 @@ static __global__ void rms_norm_f32(const float * x,
 }
 
 template <int block_size>
+static __global__ void recurrent_rms_scale_f32(
+        const float * x,
+        float * scale_out,
+        const int ncols,
+        const float eps) {
+    ggml_cuda_pdl_lc();
+    const int tid = threadIdx.x;
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float shared_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, shared_sum);
+    if (tid == 0) {
+        *scale_out = rsqrtf(tmp / ncols + eps);
+    }
+}
+
+static __device__ __forceinline__ float recurrent_normalized_boundary_value_q8(
+        const float scale,
+        const float x,
+        const float mul) {
+    float value = scale * x;
+    value = value * mul;
+    return value;
+}
+
+static __global__ void recurrent_quantize_q8_1_from_scale(
+        const float * x,
+        const float * mul,
+        const float * scale_ptr,
+        block_q8_1 * y,
+        const int ncols) {
+    ggml_cuda_pdl_lc();
+    const int i0 = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i0 >= ncols) {
+        return;
+    }
+
+    const int ib = i0 / QK8_1;
+    const int iqs = i0 % QK8_1;
+    ggml_cuda_pdl_sync();
+    const float xi = recurrent_normalized_boundary_value_q8(*scale_ptr, x[i0], mul[i0]);
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float sum = warp_reduce_sum<QK8_1>(xi);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    y[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
+template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
@@ -557,6 +616,46 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+void ggml_cuda_op_recurrent_norm_scale_q8_island(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * rms_norm,
+        ggml_tensor * mul_tensor,
+        void * q8_1,
+        float * scale) {
+    const ggml_tensor * rms_input = rms_norm->src[0];
+    const ggml_tensor * norm_weight = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    GGML_ASSERT(rms_norm->op == GGML_OP_RMS_NORM && mul_tensor->op == GGML_OP_MUL);
+    GGML_ASSERT(rms_input->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm_weight->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(rms_input->ne[0] == 5120 && ggml_nelements(rms_input) == 5120);
+    GGML_ASSERT(ggml_are_same_shape(rms_input, norm_weight));
+    GGML_ASSERT(ggml_are_same_shape(rms_input, mul_tensor));
+    GGML_ASSERT(ggml_is_contiguous(rms_input));
+    GGML_ASSERT(ggml_is_contiguous(norm_weight));
+    GGML_ASSERT(q8_1 != nullptr && scale != nullptr && eps >= 0.0f);
+
+    cudaStream_t stream = ctx.stream();
+    constexpr int scale_block_size = 1024;
+    const ggml_cuda_kernel_launch_params scale_params(
+        dim3(1, 1, 1), dim3(scale_block_size, 1, 1), 32 * sizeof(float), stream);
+    ggml_cuda_kernel_launch(recurrent_rms_scale_f32<scale_block_size>, scale_params,
+        static_cast<const float *>(rms_input->data), scale, 5120, eps);
+
+    constexpr int q8_block_size = 256;
+    const ggml_cuda_kernel_launch_params q8_params(
+        dim3((5120 + q8_block_size - 1) / q8_block_size, 1, 1),
+        dim3(q8_block_size, 1, 1), 0, stream);
+    ggml_cuda_kernel_launch(recurrent_quantize_q8_1_from_scale, q8_params,
+        static_cast<const float *>(rms_input->data),
+        static_cast<const float *>(norm_weight->data),
+        scale,
+        static_cast<block_q8_1 *>(q8_1),
+        5120);
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
