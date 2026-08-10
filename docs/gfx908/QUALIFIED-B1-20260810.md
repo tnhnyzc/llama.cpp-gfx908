@@ -1,5 +1,10 @@
 # Qualified shallow-B1 consolidation: 2026-08-10
 
+> **Current disposition:** this four-effect state was committed, qualified
+> through upstream merge `e9bc41ced`, and released in the production binary
+> sourced from `bef571964`. The upstream merge was performance-equivalent and
+> does not replace the frozen calibration below.
+
 This record freezes the last fully measured state on upstream parent
 `ead92eb55c6b17f45af99fbcf381414e76757f92` before the August 10 upstream
 integration.
@@ -83,7 +88,7 @@ boundaries must not be broadened or erased.
 
 ## Freeze boundary
 
-Tag this state before upstream integration. Upstream changes require a new
-build and oracle; they do not retroactively change this measurement. Do not
-start another optimization branch from this checkpoint without a new
-authorized investigation.
+The pre-upstream state is tagged `gfx908-b1-qualified-ead92-20260810`; the
+qualified upstream and binary-source checkpoints have separate release tags.
+Future upstream or source changes require a new build and oracle and do not
+retroactively alter this measurement.

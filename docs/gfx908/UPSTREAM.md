@@ -1,36 +1,32 @@
 # Upstream and branch policy
 
-This is a standalone repository rather than a GitHub fork so it can coexist
-with the account's upstream-contribution fork.
+The public repository intentionally has two branches:
+
+- `gfx908-production` — the qualified MI100 fork and default branch;
+- `upstream` — the pristine upstream commit used by the latest qualified merge.
+
+Experiments and historical worktree states are not published as branches.
+Qualified checkpoints use annotated tags; the compact history-archive tag
+retains the removed branch tips when forensic recovery is needed.
 
 Recommended remotes:
 
 ```sh
-git remote add upstream https://github.com/ggml-org/llama.cpp.git
 git remote add origin https://github.com/tnhnyzc/llama.cpp-gfx908.git
+git remote add upstream https://github.com/ggml-org/llama.cpp.git
 ```
 
-## Branches
+## Promotion procedure
 
-- `gfx908-production`: exact source of the last qualified daily build. This is
-  the default branch until a newer upstream integration passes the full oracle.
-- `upstream`: mirror of a known upstream commit, with no local changes.
-- `gfx908-next`: integration branch for upstream updates and qualified new work.
-- `experiments/<topic>`: disposable or retained investigations. An experiment
-  is never merged solely because a microbenchmark improved.
+1. Fetch upstream and record both source tips.
+2. Integrate on an isolated local branch or worktree.
+3. Resolve conflicts by mechanism and preserve gfx908 guards.
+4. Build into a new dated directory with a manifest.
+5. Run correctness, deterministic-output, model-route, and controlled
+   performance gates appropriate to the changed code.
+6. Promote only the validated state to `gfx908-production`.
+7. Move `upstream` to the pristine commit that was actually qualified.
+8. Tag the release and retain the prior build/config for rollback.
 
-## Update procedure
-
-1. Fetch upstream and record the old/new base commits.
-2. Rebase or replay the five logical change groups onto `gfx908-next`.
-3. Resolve conflicts by mechanism, not by blindly preferring either side.
-4. Build into a new directory.
-5. Run the correctness, perplexity, PP, TG, MTP and thermal oracle.
-6. Compare against both current production and pristine new upstream.
-7. Promote `gfx908-next` only when it is non-regressing on daily models and all
-   accepted changes remain attributable.
-8. Tag the promoted state and retain the old build/config for rollback.
-
-The upstream branch may move regularly; the production branch should move only
-after hardware qualification. That keeps daily use stable without allowing the
-fork to become permanently detached from llama.cpp development.
+Microbenchmark improvement alone never earns promotion, and historical archive
+refs should not be republished as normal GitHub branches.

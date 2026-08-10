@@ -1,5 +1,9 @@
 # Engineering record
 
+> This file preserves architecture findings and corrected hypotheses from the
+> longer investigation. Current production scope is summarized in
+> [STATUS.md](STATUS.md).
+
 ## What the investigation established
 
 The MI100 was healthy before source tuning: the original sustained memory tests

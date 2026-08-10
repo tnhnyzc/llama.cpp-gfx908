@@ -1,98 +1,68 @@
-# Optimization status
+# gfx908 production status
 
-This file is the short source of truth for what is enabled, what must be opted
-into, and what should not be mistaken for a production result.
+This is the concise source of truth for the MI100 fork as frozen on 2026-08-10.
 
-## Qualified defaults
+## Source and deployment
 
-- CDNA1 wave64 dequantization for the covered quant types. Set
-  `GGML_HIP_DEQUANT_WAVE64=0` to restore the upstream launch geometry.
-- CDNA1 N=1 MMVQ rows-per-block selection: two rows for supported types and one
-  row for Q5_K. Override with `GGML_HIP_MMVQ_ROWS_GFX908` for regression tests.
-- CDNA1 DPP reductions scoped to MMVQ.
-- IQ4_NL 16-byte N=1 load path.
-- Q4_K/Q5_K branchless scale/min reconstruction and q8_1 block-sum reuse.
-- CDNA1 flash-attention f32 MFMA accumulation for prefill-width tiles while
-  retaining the smaller accumulator for latency-sensitive decode.
-- Head-size 512 MFMA routing. Set `GGML_HIP_FATTN_MMA_HS512=0` to restore the
-  upstream head-size bound.
-- Long-context 32x2 FA tile at KV >= 8192. Set
-  `GGML_HIP_FATTN_LONGCTX_GFX908=0` to disable it.
-- CDNA1 quantized FA KQ subgroup width and the measured vector/MMA crossover.
-  `GGML_HIP_FATTN_MMA_DECODE_THRESH` remains available for crossover sweeps.
-- Q4_0/Q4_1/Q5_0/Q5_1 CDNA1 MMQ batch routing.
+- Public branches: `gfx908-production` and `upstream` only.
+- Qualified binary source: `bef57196449ac04d8dd61412faabb69a917bb3af`.
+- Dated build:
+  `/home/llm/mi100/llama.cpp-gfx908/build-prod-20260810-bailingmoe3`.
+- Previous build and pre-deployment config remain available for rollback.
+- `llama-swap` MI100-only llama.cpp profiles use the dated build; mixed and
+  vLLM profiles are unchanged.
 
-## Opt-in production routes
+The final build reports llama.cpp `10398 (bef571964)` and passed:
 
-- `GGML_HIP_GEMM_AUTOTUNE_GFX908=1`: exact-shape rocBLAS solution tuning.
-  Persist results with `GGML_HIP_GEMM_AUTOTUNE_CACHE=/path/to/cache.tsv`.
-- `GGML_HIP_IQ4_NL_FUSED_GFX908=1`: exact Qwen FFN IQ4_NL prefill route for
-  qualified M values. This is shape-specific, not a universal IQ4 kernel.
-- `GGML_HIP_GDN_CHUNK_GFX908=1`: exact-shape chunked Qwen GDN prefill. Requires
-  `GGML_HIP_GDN_CHUNK_GFX908_DIR` to reference the verified runtime packaged in
-  `build-prod/runtime/gdn`.
-- `GGML_HIP_Q5_K_MMQ_N3_GFX908=1`: exact Q5_K speculative-width route.
-- `GGML_HIP_DISABLE_GFX908_M2_GATE_FUSION=1`: disables the IQ4_NL M=2 gate/up
-  fusion when the selected workload performs better without it.
-- `GGML_HIP_RECURRENT_MMVF_PAIR_GFX908=1`: selects the qualified exact
-  48-pair recurrent MMVF execution route. The CDNA1 MMVF 256-thread selector
-  is retained in source independently.
-- `GGML_HIP_RECURRENT_NORM_SCALE_ISLAND_GFX908=1`: enables the qualified exact
-  48-group scale/q8/paired-MMVF island. It requires the recurrent pair route
-  and preserves the materialized normalized-f32 numerical boundary at its
-  consumers.
-- `GGML_HIP_SHARED_NORM_Q8_GFX908=1`: enables the strict disjoint direct
-  norm-to-q8 route for producers whose complete fanout is eligible MMVQ.
+- 1358/1358 selected ROCm RMS_NORM, MUL, and MUL_MAT cases;
+- the architecture registry, including BailingMoE3; and
+- 111 chat-parser tests / 524 assertions with zero failures.
 
-The exact four-way state and its frozen Qwen3.6-27B IQ4_NL B1 measurement are
-recorded in [QUALIFIED-B1-20260810.md](QUALIFIED-B1-20260810.md).
+## Qualified shallow-B1 composition
 
-## Measurement controls
+The production code contains exactly four newly qualified effects:
 
-- `GGML_HIP_FATTN_NCOLS_256` and `GGML_HIP_FATTN_NCOLS_512` override FA tile
-  geometry for controlled sweeps; defaults are the qualified selectors.
-- `GGML_HIP_GEMM_AUTOTUNE_DEBUG=1` and
-  `GGML_HIP_GDN_CHUNK_GFX908_DEBUG=1` enable diagnostic logging.
-- `GGML_HIP_CONCAT_TRANSPOSE_GFX908` controls the transposed concat path.
+1. CDNA1 MMVF 256-thread selection;
+2. recurrent paired-256 MMVF execution for 48 sibling pairs;
+3. a 48-group recurrent norm-scale/q8/paired-MMVF island; and
+4. the disjoint strict direct norm-to-q8 route for 80 producers and 112 MMVQ
+   consumers.
 
-## Not production claims
+Together they measure `41.7817 t/s / 23.933923 ms/token` on the canonical
+Qwen3.6-27B IQ4_NL shallow-B1 workload. The recurrent population takes
+priority over direct q8, preventing overlap or double counting.
 
-- A standalone fused IQ4_NL FP16-MFMA feasibility kernel substantially reduced
-  decode overhead but did not yet beat the selected Tensile schedule. It is not
-  the same as a complete production fused kernel.
-- Several invalid or incomplete MMQ geometries produced attractive numbers
-  before failing full output-coverage tests. They are intentionally absent.
-- Q4_0 wider-load experiments did not reproduce the IQ4_NL gain in the full
-  model and are absent.
-- Q6_K metadata deletion bounded that path at about 0.61% of its tested kernel;
-  no corresponding rewrite is retained.
-- MXFP4 and IQ2_S full-server probes on offloaded MoE models cannot isolate GPU
-  MMVQ performance and are not treated as kernel conclusions.
-- Broad compiler flags, XNACK targeting, larger MMVQ wave counts, and the tested
-  manual software-prefetch variants were neutral or negative.
+## Runtime controls
 
-## Deployment layout
+- `GGML_HIP_GEMM_AUTOTUNE_GFX908=1` enables exact-shape rocBLAS tuning; use
+  `GGML_HIP_GEMM_AUTOTUNE_CACHE` for the persistent cache.
+- `GGML_HIP_GDN_CHUNK_GFX908=1` enables the qualified chunked recurrent path;
+  `GGML_HIP_GDN_CHUNK_GFX908_DIR` must identify the packaged HSACO directory.
+- `GGML_HIP_Q5_K_MMQ_N3_GFX908=1` enables the retained Q5_K N3 route.
+- `GGML_HIP_RECURRENT_MMVF_PAIR_GFX908=1` selects the 48-pair projection path.
+- `GGML_HIP_RECURRENT_NORM_SCALE_ISLAND_GFX908=1` selects the dependent
+  norm-scale island and requires the recurrent pair route.
+- `GGML_HIP_SHARED_NORM_Q8_GFX908=1` selects the strict disjoint direct-q8 path.
 
-- `/home/llm/mi100/llama.cpp-gfx908` is the only production source tree.
-- `/home/llm/mi100/llama.cpp-gfx908/build-prod` is the only production HIP
-  build.
-- `/home/llm/mi100/llama.cpp-gfx908-current` is the atomic deployment symlink.
-- GDN HSACO files live inside `build-prod/runtime/gdn` and are verified against
-  `scripts/gfx908/gdn-sha256.txt`.
-- Experimental branches remain in Git; they do not require persistent
-  worktrees or build products.
+The older guarded CDNA1 dequantization, MMVQ, flash-attention, and exact-shape
+prefill controls remain in source. See `--help`, source guards, and
+[BUILD.md](BUILD.md) before enabling a route on a different model or shape.
 
-The 2026-08-02 canonical release is commit `387c97018`. Its ROCm MUL_MAT fence
-passed 1,216/1,216 cases, Qwen Q6 and IQ4_NL started with that fingerprint, and
-a 3,799-token native-tool prompt exercised chunked GDN without the former HSACO
-lookup failure. All llama.cpp MI100 profiles in llama-swap use this release.
+## Serving notes
 
-## Open portability work
+- Qwen3.6/Qwen3.8 and Gemma 4 MTP profiles explicitly use
+  `--spec-draft-p-min 0.0`; Qwen testing found `0.5` slower despite a higher
+  reported acceptance ratio.
+- Muse retains its separately established DFlash `p_min=0.6` setting.
+- Gemma 4 plus its real MTP model loaded and generated successfully.
+- Ling 3.0 Flash loaded and generated through BailingMoE3. Its single cold,
+  partly host-offloaded observation is not a qualified performance result.
 
-- Package the chunked GDN kernel source and reproducible HSACO build process.
-- Add CI that at least compiles the HIP/gfx908 target; hardware performance CI
-  is not currently available.
-- Rebase onto future upstream updates and repeat the complete oracle before
-  changing the production branch.
-- Re-check generic paths touched by the old production tree and add explicit
-  CDNA1 guards wherever the optimization is not intended for CUDA/RDNA.
+## Explicit exclusions
+
+Production does not include the failed or below-threshold MTP N3 one-wave,
+stripped/one-wave IQ4_NL, mixed f32+q8, generic wave64 packing, Q/K L2-GDN,
+MMVF split-column, recurrent gated-q8, destructive MMVQ, or STREAM-floor
+experiments. Do not infer production support from their archived source.
+
+No further optimization branch is open at this freeze point.

@@ -1,78 +1,57 @@
 # Building for gfx908
 
-## Canonical release build
+## Release configuration
 
-The daily MI100 deployment is built from this repository with one command:
-
-```sh
-scripts/gfx908/build-release.sh
-```
-
-The canonical output is `build-prod`. It contains the server, CLI, benchmark
-and backend-test binaries, the exact GDN HSACO files used at runtime, and a
-`BUILD-MANIFEST.txt` recording the source commit, ROCm prefix and binary
-hashes. `scripts/gfx908/validate-release.sh` rejects an incomplete or stale
-release before deployment.
-
-llama-swap should reference only the stable `llama.cpp-gfx908-current` symlink
-and `build-prod`; experimental worktrees and build directories are never
-production dependencies.
-
-## Tested configuration
-
-The qualified build used Ubuntu in a Proxmox VM with the MI100 passed through,
-a custom ROCm development stack, and:
+Use a fresh build directory and the qualified ROCm prefix:
 
 ```sh
+ROCM_DIR=/path/to/rocm-gfx908
+
 cmake -S . -B build-gfx908 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_HIP=ON \
+  -DCMAKE_PREFIX_PATH="$ROCM_DIR" \
+  -DCMAKE_HIP_COMPILER="$ROCM_DIR/lib/llvm/bin/clang++" \
   -DCMAKE_HIP_ARCHITECTURES=gfx908 \
+  -DGGML_HIP=ON \
+  -DGGML_HIP_GRAPHS=ON \
+  -DGGML_HIP_MMQ_MFMA=ON \
+  -DGGML_HIP_NO_VMM=ON \
   -DGGML_NATIVE=ON \
-  -DGGML_OPENMP=ON
+  -DBUILD_SHARED_LIBS=ON \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_BUILD_TESTS=ON
 
-cmake --build build-gfx908 --config Release -j
+cmake --build build-gfx908 -j
 ```
 
-When ROCm is not installed in a system path, prepend its `bin` directory to
-`PATH` and pass its prefix through `CMAKE_PREFIX_PATH`. At runtime, ensure its
-`lib`, `lib64`, LLVM library directory, and the build's `bin` directory are in
-`LD_LIBRARY_PATH`.
+At runtime, put the build's `bin` directory and the ROCm `lib`, `lib64`, and
+LLVM library directories in `LD_LIBRARY_PATH`. The server should identify the
+device as gfx908/CDNA1 and report the expected HIP graph/MMQ capabilities.
 
-Verify the target in startup output. A qualified build should identify the AMD
-device as CDNA1/gfx908 and report HIP flash attention and MMQ MFMA support.
+## External recurrent runtime
 
-## Optional recurrent prefill kernels
-
-The chunked GDN path dynamically loads five precompiled gfx908 HSACO files. The
-public repository records their qualified hashes but does not publish the
-binaries while their source and license/provenance are being packaged. The
-release script verifies the local qualified set and copies it into
-`build-prod/runtime/gdn`, making the deployed build self-contained.
-
-Set both variables when using that path:
+The chunked GDN route dynamically loads five qualified gfx908 HSACO files.
+Package them under the release build, for example `runtime/gdn`, then set:
 
 ```sh
 export GGML_HIP_GDN_CHUNK_GFX908=1
-export GGML_HIP_GDN_CHUNK_GFX908_DIR=/path/to/llama.cpp-gfx908-current/build-prod/runtime/gdn
+export GGML_HIP_GDN_CHUNK_GFX908_DIR=/path/to/build-gfx908/runtime/gdn
 ```
 
-Without `GGML_HIP_GDN_CHUNK_GFX908=1`, the normal llama.cpp recurrence remains
-active. The route is guarded to the exact qualified Qwen GDN dimensions and
-falls back for other shapes.
+The normal llama.cpp recurrent path remains active when the feature is off or
+the exact shape is ineligible. Record the HSACO and binary hashes in a build
+manifest; do not make a production profile depend on an experiment directory.
 
-## Minimum validation before daily use
+## Minimum release gate
 
-1. Build without warnings promoted to errors.
-2. Run `test-backend-ops` for the complete HIP matmul and flash-attention sets.
-3. Run the production-shaped cases added by this branch.
-4. Compare deterministic logits/tokens against the upstream control.
-5. Run perplexity on the same corpus and invocation for both builds.
-6. Run reversed-order warm A/B performance tests.
-7. Deploy through a new build directory and retain the previous binary/config
-   as the rollback target.
+Before changing a serving profile:
 
-The clean public history has been rebuilt successfully for the gfx908 target.
-It has not yet completed the hardware runtime and performance oracle on an
-MI100. The next MI100 session should perform that final reproducibility fence
-before replacing the existing daily build.
+1. record source commit, compiler/ROCm prefix, CMake options, and binary hashes;
+2. run the covered ROCm backend tests, including production-shaped cases;
+3. verify deterministic output and the expected runtime route census;
+4. run matched, thermally controlled performance A/Bs where source changed;
+5. smoke the affected real model and speculative route; and
+6. deploy to a new dated directory while retaining the previous build/config.
+
+The current qualified build and exact results are recorded in
+[STATUS.md](STATUS.md) and [QUALIFIED-B1-20260810.md](QUALIFIED-B1-20260810.md).

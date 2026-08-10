@@ -1,5 +1,9 @@
 # Benchmark and correctness record
 
+> This is the retained historical measurement record. For the current frozen
+> production result and deployment identity, start with [README.md](README.md)
+> and [STATUS.md](STATUS.md).
+
 ## Oracle rules
 
 Performance numbers are accepted only when the test records:
