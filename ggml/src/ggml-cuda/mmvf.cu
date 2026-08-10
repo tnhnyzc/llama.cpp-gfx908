@@ -4,6 +4,226 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+template <int block_size>
+static __global__ void recurrent_mmvf_pair_f32(
+        const float * first_weight,
+        const float * second_weight,
+        const float * input,
+        float * first_dst,
+        float * second_dst,
+        const int ncols) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float2 * w0 = reinterpret_cast<const float2 *>(first_weight + int64_t(row) * ncols);
+    const float2 * w1 = reinterpret_cast<const float2 *>(second_weight + int64_t(row) * ncols);
+    const float2 * x = reinterpret_cast<const float2 *>(input);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int col2 = tid; col2 < ncols / 2; col2 += block_size) {
+        const float2 a = w0[col2];
+        const float2 b = w1[col2];
+        const float2 v = x[col2];
+        ggml_cuda_mad(sum0, a.x, v.x);
+        ggml_cuda_mad(sum0, a.y, v.y);
+        ggml_cuda_mad(sum1, b.x, v.x);
+        ggml_cuda_mad(sum1, b.y, v.y);
+    }
+
+    sum0 = warp_reduce_sum<warp_size>(sum0);
+    sum1 = warp_reduce_sum<warp_size>(sum1);
+    __shared__ float shared0[warp_size];
+    __shared__ float shared1[warp_size];
+    if (tid < warp_size) {
+        shared0[tid] = 0.0f;
+        shared1[tid] = 0.0f;
+    }
+    __syncthreads();
+    shared0[tid / warp_size] = sum0;
+    shared1[tid / warp_size] = sum1;
+    __syncthreads();
+    if (tid < warp_size) {
+        sum0 = warp_reduce_sum<warp_size>(shared0[tid]);
+        sum1 = warp_reduce_sum<warp_size>(shared1[tid]);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        first_dst[row] = sum0;
+        second_dst[row] = sum1;
+    }
+}
+
+static __device__ __forceinline__ float recurrent_normalized_boundary_value_mmvf(
+        const float scale,
+        const float x,
+        const float mul) {
+    float value = scale * x;
+    value = value * mul;
+    return value;
+}
+
+template <int block_size>
+static __global__ void recurrent_mmvf_pair_from_scale_f32(
+        const float * first_weight,
+        const float * second_weight,
+        const float * rms_input,
+        const float * norm_weight,
+        const float * scale_ptr,
+        float * first_dst,
+        float * second_dst,
+        const int ncols) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float scale = *scale_ptr;
+    const float2 * w0 = reinterpret_cast<const float2 *>(first_weight + int64_t(row) * ncols);
+    const float2 * w1 = reinterpret_cast<const float2 *>(second_weight + int64_t(row) * ncols);
+    const float2 * x = reinterpret_cast<const float2 *>(rms_input);
+    const float2 * mul = reinterpret_cast<const float2 *>(norm_weight);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int col2 = tid; col2 < ncols / 2; col2 += block_size) {
+        const float2 a = w0[col2];
+        const float2 b = w1[col2];
+        const float2 xv = x[col2];
+        const float2 mv = mul[col2];
+        const float n0 = recurrent_normalized_boundary_value_mmvf(scale, xv.x, mv.x);
+        const float n1 = recurrent_normalized_boundary_value_mmvf(scale, xv.y, mv.y);
+        ggml_cuda_mad(sum0, a.x, n0);
+        ggml_cuda_mad(sum0, a.y, n1);
+        ggml_cuda_mad(sum1, b.x, n0);
+        ggml_cuda_mad(sum1, b.y, n1);
+    }
+
+    sum0 = warp_reduce_sum<warp_size>(sum0);
+    sum1 = warp_reduce_sum<warp_size>(sum1);
+    __shared__ float shared0[warp_size];
+    __shared__ float shared1[warp_size];
+    if (tid < warp_size) {
+        shared0[tid] = 0.0f;
+        shared1[tid] = 0.0f;
+    }
+    __syncthreads();
+    shared0[tid / warp_size] = sum0;
+    shared1[tid / warp_size] = sum1;
+    __syncthreads();
+    if (tid < warp_size) {
+        sum0 = warp_reduce_sum<warp_size>(shared0[tid]);
+        sum1 = warp_reduce_sum<warp_size>(shared1[tid]);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        first_dst[row] = sum0;
+        second_dst[row] = sum1;
+    }
+}
+
+static __global__ void recurrent_mmvf_pair_add_f32(
+        const float * src,
+        const float * bias,
+        float * dst,
+        const int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        dst[i] = src[i] + bias[i];
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f_recurrent_pair(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * first_weight,
+        const ggml_tensor * second_weight,
+        const ggml_tensor * input,
+        ggml_tensor * first_dst,
+        void * second_scratch) {
+    GGML_ASSERT(first_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(second_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(first_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(first_weight->ne[0] == 5120 && first_weight->ne[1] == 48);
+    GGML_ASSERT(ggml_are_same_shape(first_weight, second_weight));
+    GGML_ASSERT(input->ne[0] == 5120 && ggml_nelements(input) == 5120);
+    GGML_ASSERT(first_dst->ne[0] == 48 && ggml_nelements(first_dst) == 48);
+    GGML_ASSERT(ggml_is_contiguous(first_weight));
+    GGML_ASSERT(ggml_is_contiguous(second_weight));
+    GGML_ASSERT(ggml_is_contiguous(input));
+    GGML_ASSERT(ggml_is_contiguous(first_dst));
+    GGML_ASSERT(second_scratch != nullptr);
+
+    constexpr int block_size = 256;
+    const dim3 blocks(48, 1, 1);
+    const dim3 threads(block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(recurrent_mmvf_pair_f32<block_size>, params,
+        static_cast<const float *>(first_weight->data),
+        static_cast<const float *>(second_weight->data),
+        static_cast<const float *>(input->data),
+        static_cast<float *>(first_dst->data),
+        static_cast<float *>(second_scratch),
+        5120);
+}
+
+void ggml_cuda_mul_mat_vec_f_recurrent_pair_from_scale(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * first_weight,
+        const ggml_tensor * second_weight,
+        const ggml_tensor * rms_input,
+        const ggml_tensor * norm_weight,
+        const float * scale,
+        ggml_tensor * first_dst,
+        void * second_scratch) {
+    GGML_ASSERT(first_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(second_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(rms_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(first_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(first_weight->ne[0] == 5120 && first_weight->ne[1] == 48);
+    GGML_ASSERT(ggml_are_same_shape(first_weight, second_weight));
+    GGML_ASSERT(rms_input->ne[0] == 5120 && ggml_nelements(rms_input) == 5120);
+    GGML_ASSERT(ggml_are_same_shape(rms_input, norm_weight));
+    GGML_ASSERT(first_dst->ne[0] == 48 && ggml_nelements(first_dst) == 48);
+    GGML_ASSERT(ggml_is_contiguous(first_weight));
+    GGML_ASSERT(ggml_is_contiguous(second_weight));
+    GGML_ASSERT(ggml_is_contiguous(rms_input));
+    GGML_ASSERT(ggml_is_contiguous(norm_weight));
+    GGML_ASSERT(ggml_is_contiguous(first_dst));
+    GGML_ASSERT(scale != nullptr && second_scratch != nullptr);
+
+    constexpr int block_size = 256;
+    const ggml_cuda_kernel_launch_params params(dim3(48, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(recurrent_mmvf_pair_from_scale_f32<block_size>, params,
+        static_cast<const float *>(first_weight->data),
+        static_cast<const float *>(second_weight->data),
+        static_cast<const float *>(rms_input->data),
+        static_cast<const float *>(norm_weight->data),
+        scale,
+        static_cast<float *>(first_dst->data),
+        static_cast<float *>(second_scratch),
+        5120);
+}
+
+void ggml_cuda_recurrent_mmvf_pair_add(
+        ggml_backend_cuda_context & ctx,
+        const void * scratch,
+        const ggml_tensor * bias,
+        ggml_tensor * dst) {
+    GGML_ASSERT(scratch != nullptr);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(bias, dst));
+    GGML_ASSERT(ggml_nelements(dst) == 48);
+    GGML_ASSERT(ggml_is_contiguous(bias) && ggml_is_contiguous(dst));
+
+    constexpr int block_size = 64;
+    const ggml_cuda_kernel_launch_params params(dim3(1, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(recurrent_mmvf_pair_add_f32, params,
+        static_cast<const float *>(scratch),
+        static_cast<const float *>(bias->data),
+        static_cast<float *>(dst->data),
+        48);
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -433,7 +653,11 @@ void launch_mul_mat_vec_f_cuda(
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
     int64_t max_block_size  = 256;
-    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+    // The 128 cap covers every pre-RDNA AMD part by cc range and was never tuned
+    // for gfx908 specifically. CDNA1 is excluded here so it can use the 256 case
+    // the switch below already provides; every other AMD part is unchanged.
+    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1
+       && ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_CDNA1) {
         max_block_size = 128;
     }
     for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {

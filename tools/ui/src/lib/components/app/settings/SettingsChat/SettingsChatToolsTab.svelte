@@ -1,24 +1,24 @@
 <script lang="ts">
-	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { ChevronDown, ChevronRight } from '@lucide/svelte';
+	import { McpServerIdentity, TruncatedText } from '$lib/components/app';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Collapsible from '$lib/components/ui/collapsible';
-	import { TruncatedText, McpServerIdentity } from '$lib/components/app';
-	import { toolsStore } from '$lib/stores/tools.svelte';
-	import { permissionsStore } from '$lib/stores/permissions.svelte';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import { getBuiltinToolUi } from '$lib/constants/built-in-tools';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { ToolSource } from '$lib/enums/tools.enums';
+	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { permissionsStore } from '$lib/stores/permissions.svelte';
+	import { toolsStore } from '$lib/stores/tools.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 
 	let expandedGroups = new SvelteSet<string>();
 	let groups = $derived(toolsStore.toolGroups);
 
-	function toggleExpanded(label: string) {
-		if (expandedGroups.has(label)) {
-			expandedGroups.delete(label);
+	function toggleExpanded(key: string) {
+		if (expandedGroups.has(key)) {
+			expandedGroups.delete(key);
 		} else {
-			expandedGroups.add(label);
+			expandedGroups.add(key);
 		}
 	}
 </script>
@@ -27,9 +27,9 @@
 	<div class="py-8 text-center text-sm text-muted-foreground">No tools available</div>
 {:else}
 	<div class="space-y-2">
-		{#each groups as group (group.label)}
-			{@const isExpanded = expandedGroups.has(group.label)}
-			<Collapsible.Root open={isExpanded} onOpenChange={() => toggleExpanded(group.label)}>
+		{#each groups as group (group.key)}
+			{@const isExpanded = expandedGroups.has(group.key)}
+			<Collapsible.Root open={isExpanded} onOpenChange={() => toggleExpanded(group.key)}>
 				<Collapsible.Trigger
 					class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-muted/50"
 				>

@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -362,6 +363,15 @@ static bool blackwell_mma_available(const int cc) {
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
 }
 
+// Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.
+static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignment) {
+    GGML_ASSERT(tensor != nullptr);
+    return (reinterpret_cast<uintptr_t>(tensor->data) % alignment) == 0 &&
+           tensor->nb[1] % alignment == 0 &&
+           tensor->nb[2] % alignment == 0 &&
+           tensor->nb[3] % alignment == 0;
+}
+
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
@@ -443,6 +453,19 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
+#if defined(CDNA1)
+template<int dpp_ctrl>
+static __device__ __forceinline__ float ggml_hip_move_dpp_f32(float x) {
+    union {
+        float f;
+        int   i;
+    } value;
+    value.f = x;
+    value.i = __builtin_amdgcn_mov_dpp(value.i, dpp_ctrl, 0xf, 0xf, true);
+    return value.f;
+}
+#endif
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
@@ -450,6 +473,71 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+}
+
+template<int width = WARP_SIZE>
+static __device__ __forceinline__ float warp_reduce_sum_dpp(float x) {
+#if defined(CDNA1)
+    if constexpr (width == 64) {
+        // Keep the reduction in the VALU/DPP path. The generic HIP shuffle
+        // loop lowers each stage to ds_bpermute_b32 plus a dependent
+        // s_waitcnt. gfx908 can reduce each 16-lane row with DPP, combine
+        // rows with the CDNA1 row-broadcast controls, then broadcast the
+        // completed value once.
+        x += ggml_hip_move_dpp_f32<0x0b1>(x); // quad_perm:[1,0,3,2]
+        x += ggml_hip_move_dpp_f32<0x04e>(x); // quad_perm:[2,3,0,1]
+        x += ggml_hip_move_dpp_f32<0x124>(x); // row_ror:4
+        x += ggml_hip_move_dpp_f32<0x128>(x); // row_ror:8
+        x += ggml_hip_move_dpp_f32<0x142>(x); // row_bcast:15
+        x += ggml_hip_move_dpp_f32<0x143>(x); // row_bcast:31
+        return __shfl_sync(0xffffffff, x, 63, 64);
+    }
+#endif
+    return warp_reduce_sum<width>(x);
+}
+
+template<int n, int width = WARP_SIZE>
+static __device__ __forceinline__ void warp_reduce_sum_n(float * x) {
+#if defined(CDNA1)
+    if constexpr (width == 64) {
+        // Interleave independent accumulators at each DPP stage. Reducing
+        // them one at a time makes clang serialize six dependent DPP chains
+        // for MMVQ N=3 and insert latency-padding NOPs between every stage.
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x0b1>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x04e>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x124>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x128>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x142>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] += ggml_hip_move_dpp_f32<0x143>(x[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < n; ++i) {
+            x[i] = __shfl_sync(0xffffffff, x[i], 63, 64);
+        }
+        return;
+    }
+#endif
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        x[i] = warp_reduce_sum<width>(x[i]);
+    }
 }
 
 template<int width = WARP_SIZE>
@@ -618,7 +706,8 @@ template <typename T> struct block_reduce_policy<block_reduce_method::MAX, T> {
 };
 
 template <block_reduce_method reduce_method_t, const unsigned int block_size_template = 0, typename T>
-static __device__ T block_reduce(T val, T * shared_vals) {
+static __device__ T block_reduce(T val, [[maybe_unused]] T * shared_vals) {
+    // for multi-warp reductions, callers must not reuse shared_vals until all reads from this invocation have completed
     val                           = block_reduce_policy<reduce_method_t, T>::reduce(val);
     const unsigned int block_size = block_size_template == 0 ? blockDim.x : block_size_template;
     if (block_size > WARP_SIZE) {
@@ -966,6 +1055,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
     static constexpr int qk = QK1_0;
     static constexpr int qr = QR1_0;
     static constexpr int qi = QI1_0;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
+    static constexpr int qk = QK2_0;
+    static constexpr int qr = QR2_0;
+    static constexpr int qi = QI2_0;
 };
 
 template<>
@@ -1395,6 +1491,18 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_recurrent_mmvf_pair {
+    const ggml_tensor * second_weight = nullptr;
+    void * second_scratch = nullptr;
+};
+
+struct ggml_cuda_recurrent_norm_scale_island {
+    const ggml_tensor * rms_input = nullptr;
+    const ggml_tensor * norm_weight = nullptr;
+    void * q8_1 = nullptr;
+    float * scale = nullptr;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1404,6 +1512,22 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
     int curr_stream_no = 0;
+
+    // Experimental gfx908 recurrent alpha/beta execution island. The first
+    // MMVF computes both sibling projections; the second result remains in
+    // stable backend storage until its normal graph position.
+    std::unordered_map<const ggml_tensor *, ggml_cuda_recurrent_mmvf_pair> recurrent_mmvf_pair_leaders;
+    std::unordered_map<const ggml_tensor *, void *> recurrent_mmvf_pair_followers;
+    std::unordered_map<const ggml_tensor *, void *> recurrent_mmvf_pair_scratch;
+
+    // Exact 48-group recurrent norm-scale island. Active entries are rebuilt
+    // from each production graph; allocations remain stable for graph replay.
+    std::unordered_map<const ggml_tensor *, ggml_cuda_recurrent_norm_scale_island> recurrent_norm_scale_islands;
+    std::unordered_map<const ggml_tensor *, void *> recurrent_norm_scale_island_storage;
+
+    // Exact wide norm/multiply producers whose q8_1 representation is stored
+    // in their output allocation and shared by their quantized consumers.
+    std::unordered_set<const ggml_tensor *> shared_q8_1_inputs;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1649,4 +1773,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
