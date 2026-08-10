@@ -4,7 +4,24 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+
+static bool q8_reuse_census_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_HIP_Q8_REUSE_CENSUS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static const char * q8_reuse_tensor_name(const ggml_tensor * tensor) {
+    return tensor != nullptr && tensor->name[0] != '\0' ? tensor->name : "-";
+}
+
+static const char * q8_reuse_tensor_op(const ggml_tensor * tensor) {
+    return tensor != nullptr ? ggml_op_name(tensor->op) : "-";
+}
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -1518,6 +1535,22 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    if (q8_reuse_census_enabled()) {
+        const ggml_tensor * parent0 = src1->src[0];
+        const ggml_tensor * parent1 = parent0 != nullptr ? parent0->src[0] : nullptr;
+        const ggml_tensor * parent2 = parent1 != nullptr ? parent1->src[0] : nullptr;
+        std::fprintf(stderr,
+                "Q8_REUSE_CALL\tweight_type=%s\tweight_name=%s\tweight_rows=%lld\tinput_tensor=%p\tinput_data=%p\tinput_name=%s\tinput_op=%s\tinput_width=%lld\tinput_rows=%lld\tview_tensor=%p\tparent0_tensor=%p\tparent0_data=%p\tparent0_name=%s\tparent0_op=%s\tparent1_tensor=%p\tparent1_name=%s\tparent1_op=%s\tparent2_tensor=%p\tparent2_name=%s\tparent2_op=%s\tfused_gate=%s\n",
+                ggml_type_name(src0->type), q8_reuse_tensor_name(src0), (long long) ne01,
+                (const void *) src1, src1->data, q8_reuse_tensor_name(src1), q8_reuse_tensor_op(src1),
+                (long long) ne10, (long long) (ne11*ne12*ne13), (const void *) src1->view_src,
+                (const void *) parent0, parent0 != nullptr ? parent0->data : nullptr,
+                q8_reuse_tensor_name(parent0), q8_reuse_tensor_op(parent0),
+                (const void *) parent1, q8_reuse_tensor_name(parent1), q8_reuse_tensor_op(parent1),
+                (const void *) parent2, q8_reuse_tensor_name(parent2), q8_reuse_tensor_op(parent2),
+                fusion != nullptr && fusion->gate != nullptr ? q8_reuse_tensor_name(fusion->gate) : "-");
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

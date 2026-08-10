@@ -4395,6 +4395,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
+    static const bool structural_census = [] {
+        const char * env = std::getenv("GGML_HIP_STRUCTURAL_CENSUS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static bool structural_census_done = false;
+    const bool structural_log = structural_census && !structural_census_done &&
+        use_cuda_graph && cuda_graph_update_required;
+    if (structural_log) {
+        std::fprintf(stderr, "STRUCT_GRAPH_BEGIN\tn_nodes=%d\tuse_graph=%d\tupdate=%d\n",
+            cgraph->n_nodes, use_cuda_graph ? 1 : 0, cuda_graph_update_required ? 1 : 0);
+    }
+
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
@@ -4492,6 +4504,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (structural_log) {
+                    std::fprintf(stderr,
+                        "STRUCT_NODE\tidx=%d\tptr=%p\top=%s\tname=%s\tflags=%u\tview=%d\tcompute=%d",
+                        i, (void *) node, ggml_op_name(node->op), node->name, node->flags,
+                        ggml_cuda_is_view_or_noop(node) ? 1 : 0,
+                        (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 ? 1 : 0);
+                    for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                        const ggml_tensor * src = node->src[source];
+                        std::fprintf(stderr, "\tsrc%d_ptr=%p\tsrc%d_op=%s", source, (const void *) src,
+                            source, src != nullptr ? ggml_op_name(src->op) : "-");
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -4535,6 +4560,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (structural_log) {
+                        std::fprintf(stderr, "STRUCT_EXEC\tfirst=%d\tlast=%d\tlogical_nodes=%d\tfirst_op=%s\tlast_op=%s\tfused=1\n",
+                            i, i + nodes_to_skip, nodes_to_skip + 1, ggml_op_name(node->op),
+                            ggml_op_name(cgraph->nodes[i + nodes_to_skip]->op));
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4562,6 +4592,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (structural_log) {
+                    std::fprintf(stderr, "STRUCT_EXEC\tfirst=%d\tlast=%d\tlogical_nodes=1\tfirst_op=%s\tlast_op=%s\tfused=0\n",
+                        i, i, ggml_op_name(node->op), ggml_op_name(node->op));
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4578,6 +4612,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            if (structural_log) {
+                size_t graph_nodes = 0;
+                CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &graph_nodes));
+                std::vector<cudaGraphNode_t> nodes(graph_nodes);
+                if (graph_nodes > 0) {
+                    CUDA_CHECK(cudaGraphGetNodes(graph->graph, nodes.data(), &graph_nodes));
+                }
+                size_t kernel_nodes = 0;
+                for (cudaGraphNode_t graph_node : nodes) {
+                    cudaGraphNodeType type;
+                    CUDA_CHECK(cudaGraphNodeGetType(graph_node, &type));
+                    kernel_nodes += type == cudaGraphNodeTypeKernel ? 1 : 0;
+                }
+                std::fprintf(stderr, "STRUCT_DEVICE_GRAPH\ttotal_nodes=%zu\tkernel_nodes=%zu\tother_nodes=%zu\n",
+                    graph_nodes, kernel_nodes, graph_nodes - kernel_nodes);
+            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4604,6 +4654,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+
+    if (structural_log) {
+        std::fprintf(stderr, "STRUCT_GRAPH_END\n");
+        structural_census_done = true;
+    }
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -4625,6 +4680,18 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    static const bool q8_reuse_census = [] {
+        const char * env = std::getenv("GGML_HIP_Q8_REUSE_CENSUS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static uint64_t q8_reuse_graph_seq = 0;
+    const uint64_t q8_reuse_graph_id = q8_reuse_census ? ++q8_reuse_graph_seq : 0;
+
+    if (q8_reuse_census) {
+        std::fprintf(stderr, "Q8_REUSE_GRAPH_BEGIN\tgraph=%llu\tgraph_ptr=%p\tn_nodes=%d\n",
+                (unsigned long long) q8_reuse_graph_id, (void *) cgraph, cgraph->n_nodes);
+    }
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -4678,6 +4745,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (q8_reuse_census) {
+        std::fprintf(stderr, "Q8_REUSE_GRAPH_END\tgraph=%llu\tuse_graph=%d\tupdate=%d\n",
+                (unsigned long long) q8_reuse_graph_id, use_cuda_graph ? 1 : 0, cuda_graph_update_required ? 1 : 0);
+    }
 
     return GGML_STATUS_SUCCESS;
 }
