@@ -2315,6 +2315,14 @@ static bool ggml_cuda_recurrent_mmvf_pair_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_recurrent_epilogue_island_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_RECURRENT_EPILOGUE_ISLAND_GFX908");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_cuda_recurrent_mmvf_pair_candidate(const ggml_tensor * node) {
     if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
             node->src[0] == nullptr || node->src[1] == nullptr) {
@@ -4088,6 +4096,87 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // Exact Qwen3.5 recurrent alpha/beta island:
+    //   paired MMVF(alpha,beta) -> ADD -> softplus -> MUL
+    //                            -> sibling beta MMVF -> sigmoid
+    // The paired gfx908 kernel already owns both projection scalars in one
+    // workgroup per output row. Apply both scalar epilogues there and write
+    // the two final GDN inputs directly, without intermediate materialization.
+    const auto recurrent_leader = cuda_ctx->recurrent_mmvf_pair_leaders.find(node);
+    if (ggml_cuda_recurrent_epilogue_island_enabled() &&
+            recurrent_leader != cuda_ctx->recurrent_mmvf_pair_leaders.end() &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_CDNA1 &&
+            i + 8 < cgraph->n_nodes) {
+        ggml_tensor * alpha_view = cgraph->nodes[i + 1];
+        ggml_tensor * add        = cgraph->nodes[i + 2];
+        ggml_tensor * softplus   = cgraph->nodes[i + 3];
+        ggml_tensor * mul        = cgraph->nodes[i + 4];
+        ggml_tensor * gate_view  = cgraph->nodes[i + 5];
+        ggml_tensor * follower   = cgraph->nodes[i + 6];
+        ggml_tensor * beta_view  = cgraph->nodes[i + 7];
+        ggml_tensor * sigmoid    = cgraph->nodes[i + 8];
+        const auto recurrent_follower = cuda_ctx->recurrent_mmvf_pair_followers.find(follower);
+        const auto norm_island = cuda_ctx->recurrent_norm_scale_islands.find(node->src[1]);
+        const int output_nodes[] = { i + 5, i + 8 };
+
+        if (recurrent_follower != cuda_ctx->recurrent_mmvf_pair_followers.end() &&
+                recurrent_follower->second == recurrent_leader->second.second_scratch &&
+                norm_island != cuda_ctx->recurrent_norm_scale_islands.end() &&
+                ggml_can_fuse_subgraph(cgraph, i,
+                    { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD,
+                      GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE,
+                      GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY },
+                    { i + 5, i + 8 }) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, output_nodes, 2) &&
+                ggml_get_unary_op(softplus) == GGML_UNARY_OP_SOFTPLUS &&
+                ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+                alpha_view->src[0] == node &&
+                gate_view->src[0] == mul &&
+                beta_view->src[0] == follower &&
+                add->src[0] != nullptr && add->src[1] != nullptr &&
+                softplus->src[0] == add &&
+                (mul->src[0] == softplus || mul->src[1] == softplus) &&
+                sigmoid->src[0] == beta_view) {
+            const ggml_tensor * alpha_bias = add->src[0] == alpha_view ? add->src[1] :
+                                             add->src[1] == alpha_view ? add->src[0] : nullptr;
+            const ggml_tensor * alpha_gate = mul->src[0] == softplus ? mul->src[1] : mul->src[0];
+            if (alpha_bias != nullptr && alpha_gate != nullptr &&
+                    alpha_bias->type == GGML_TYPE_F32 && alpha_gate->type == GGML_TYPE_F32 &&
+                    mul->type == GGML_TYPE_F32 && sigmoid->type == GGML_TYPE_F32 &&
+                    ggml_nelements(alpha_bias) == 48 && ggml_nelements(alpha_gate) == 48 &&
+                    ggml_are_same_shape(alpha_bias, alpha_gate) &&
+                    ggml_are_same_shape(alpha_bias, mul) &&
+                    ggml_nelements(sigmoid) == 48 &&
+                    ggml_is_contiguous(alpha_bias) && ggml_is_contiguous(alpha_gate) &&
+                    ggml_is_contiguous(mul) && ggml_is_contiguous(sigmoid)) {
+                ggml_cuda_mul_mat_vec_f_recurrent_pair_from_scale_epilogue(
+                    *cuda_ctx,
+                    node->src[0],
+                    recurrent_leader->second.second_weight,
+                    norm_island->second.rms_input,
+                    norm_island->second.norm_weight,
+                    norm_island->second.scale,
+                    alpha_bias,
+                    alpha_gate,
+                    mul,
+                    sigmoid);
+
+                static uint64_t census_sequence = 0;
+                static const bool census = [] {
+                    const char * env = getenv("GGML_HIP_RECURRENT_EPILOGUE_ISLAND_CENSUS");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (census && census_sequence++ < 64) {
+                    std::fprintf(stderr,
+                        "RECURRENT_EPILOGUE_ISLAND_CENSUS\tsequence=%" PRIu64
+                        "\tleader=%s\tfollower=%s\talpha_dst=%s\tbeta_dst=%s\n",
+                        census_sequence, node->name, follower->name, gate_view->name, sigmoid->name);
+                }
+                return 8;
+            }
+        }
+    }
 
     // The paired leader stores the second exact MMVF result in stable scratch.
     // At the follower's normal graph position, preserve the existing

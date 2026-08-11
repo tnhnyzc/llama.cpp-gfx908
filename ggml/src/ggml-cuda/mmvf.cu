@@ -63,6 +63,14 @@ static __device__ __forceinline__ float recurrent_normalized_boundary_value_mmvf
     return value;
 }
 
+static __device__ __forceinline__ float recurrent_softplus_mmvf(const float x) {
+    return x > 20.0f ? x : logf(1.0f + expf(x));
+}
+
+static __device__ __forceinline__ float recurrent_sigmoid_mmvf(const float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
 template <int block_size>
 static __global__ void recurrent_mmvf_pair_from_scale_f32(
         const float * first_weight,
@@ -117,6 +125,70 @@ static __global__ void recurrent_mmvf_pair_from_scale_f32(
     if (tid == 0) {
         first_dst[row] = sum0;
         second_dst[row] = sum1;
+    }
+}
+
+template <int block_size>
+static __global__ void recurrent_mmvf_pair_from_scale_epilogue_f32(
+        const float * first_weight,
+        const float * second_weight,
+        const float * rms_input,
+        const float * norm_weight,
+        const float * scale_ptr,
+        const float * alpha_bias,
+        const float * alpha_gate,
+        float * alpha_dst,
+        float * beta_dst,
+        const int ncols) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float scale = *scale_ptr;
+    const float2 * w0 = reinterpret_cast<const float2 *>(first_weight + int64_t(row) * ncols);
+    const float2 * w1 = reinterpret_cast<const float2 *>(second_weight + int64_t(row) * ncols);
+    const float2 * x = reinterpret_cast<const float2 *>(rms_input);
+    const float2 * mul = reinterpret_cast<const float2 *>(norm_weight);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int col2 = tid; col2 < ncols / 2; col2 += block_size) {
+        const float2 a = w0[col2];
+        const float2 b = w1[col2];
+        const float2 xv = x[col2];
+        const float2 mv = mul[col2];
+        const float n0 = recurrent_normalized_boundary_value_mmvf(scale, xv.x, mv.x);
+        const float n1 = recurrent_normalized_boundary_value_mmvf(scale, xv.y, mv.y);
+        ggml_cuda_mad(sum0, a.x, n0);
+        ggml_cuda_mad(sum0, a.y, n1);
+        ggml_cuda_mad(sum1, b.x, n0);
+        ggml_cuda_mad(sum1, b.y, n1);
+    }
+
+    sum0 = warp_reduce_sum<warp_size>(sum0);
+    sum1 = warp_reduce_sum<warp_size>(sum1);
+    __shared__ float shared0[warp_size];
+    __shared__ float shared1[warp_size];
+    if (tid < warp_size) {
+        shared0[tid] = 0.0f;
+        shared1[tid] = 0.0f;
+    }
+    __syncthreads();
+    shared0[tid / warp_size] = sum0;
+    shared1[tid / warp_size] = sum1;
+    __syncthreads();
+    if (tid < warp_size) {
+        sum0 = warp_reduce_sum<warp_size>(shared0[tid]);
+        sum1 = warp_reduce_sum<warp_size>(shared1[tid]);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        // These volatile values preserve the existing f32 projection
+        // materialization boundaries before the scalar epilogues.
+        volatile float alpha_materialized = sum0;
+        volatile float beta_materialized = sum1;
+        const float biased = alpha_materialized + alpha_bias[row];
+        alpha_dst[row] = recurrent_softplus_mmvf(biased) * alpha_gate[row];
+        beta_dst[row] = recurrent_sigmoid_mmvf(beta_materialized);
     }
 }
 
@@ -201,6 +273,58 @@ void ggml_cuda_mul_mat_vec_f_recurrent_pair_from_scale(
         scale,
         static_cast<float *>(first_dst->data),
         static_cast<float *>(second_scratch),
+        5120);
+}
+
+void ggml_cuda_mul_mat_vec_f_recurrent_pair_from_scale_epilogue(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * first_weight,
+        const ggml_tensor * second_weight,
+        const ggml_tensor * rms_input,
+        const ggml_tensor * norm_weight,
+        const float * scale,
+        const ggml_tensor * alpha_bias,
+        const ggml_tensor * alpha_gate,
+        ggml_tensor * alpha_dst,
+        ggml_tensor * beta_dst) {
+    GGML_ASSERT(first_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(second_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(rms_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(alpha_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(alpha_gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(alpha_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(first_weight->ne[0] == 5120 && first_weight->ne[1] == 48);
+    GGML_ASSERT(ggml_are_same_shape(first_weight, second_weight));
+    GGML_ASSERT(rms_input->ne[0] == 5120 && ggml_nelements(rms_input) == 5120);
+    GGML_ASSERT(ggml_are_same_shape(rms_input, norm_weight));
+    GGML_ASSERT(ggml_nelements(alpha_bias) == 48 && ggml_nelements(alpha_gate) == 48);
+    GGML_ASSERT(ggml_are_same_shape(alpha_bias, alpha_gate));
+    GGML_ASSERT(ggml_are_same_shape(alpha_bias, alpha_dst));
+    GGML_ASSERT(ggml_nelements(beta_dst) == 48);
+    GGML_ASSERT(ggml_is_contiguous(first_weight));
+    GGML_ASSERT(ggml_is_contiguous(second_weight));
+    GGML_ASSERT(ggml_is_contiguous(rms_input));
+    GGML_ASSERT(ggml_is_contiguous(norm_weight));
+    GGML_ASSERT(ggml_is_contiguous(alpha_bias));
+    GGML_ASSERT(ggml_is_contiguous(alpha_gate));
+    GGML_ASSERT(ggml_is_contiguous(alpha_dst));
+    GGML_ASSERT(ggml_is_contiguous(beta_dst));
+    GGML_ASSERT(scale != nullptr);
+
+    constexpr int block_size = 256;
+    const ggml_cuda_kernel_launch_params params(dim3(48, 1, 1), dim3(block_size, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(recurrent_mmvf_pair_from_scale_epilogue_f32<block_size>, params,
+        static_cast<const float *>(first_weight->data),
+        static_cast<const float *>(second_weight->data),
+        static_cast<const float *>(rms_input->data),
+        static_cast<const float *>(norm_weight->data),
+        scale,
+        static_cast<const float *>(alpha_bias->data),
+        static_cast<const float *>(alpha_gate->data),
+        static_cast<float *>(alpha_dst->data),
+        static_cast<float *>(beta_dst->data),
         5120);
 }
 

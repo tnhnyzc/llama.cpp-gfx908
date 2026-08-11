@@ -23,6 +23,18 @@ void ggml_cuda_mul_mat_vec_f_recurrent_pair_from_scale(
     ggml_tensor * first_dst,
     void * second_scratch);
 
+void ggml_cuda_mul_mat_vec_f_recurrent_pair_from_scale_epilogue(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * first_weight,
+    const ggml_tensor * second_weight,
+    const ggml_tensor * rms_input,
+    const ggml_tensor * norm_weight,
+    const float * scale,
+    const ggml_tensor * alpha_bias,
+    const ggml_tensor * alpha_gate,
+    ggml_tensor * alpha_dst,
+    ggml_tensor * beta_dst);
+
 void ggml_cuda_recurrent_mmvf_pair_add(
     ggml_backend_cuda_context & ctx,
     const void * scratch,
