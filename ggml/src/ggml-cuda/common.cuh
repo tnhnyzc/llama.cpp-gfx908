@@ -1525,6 +1525,10 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_recurrent_norm_scale_island> recurrent_norm_scale_islands;
     std::unordered_map<const ggml_tensor *, void *> recurrent_norm_scale_island_storage;
 
+    // L2 outputs produced by the exact gfx908 SSM producer island. These are
+    // rebuilt for each graph evaluation and skipped at their normal positions.
+    std::unordered_set<const ggml_tensor *> recurrent_ssm_l2_fused_nodes;
+
     // Exact wide norm/multiply producers whose q8_1 representation is stored
     // in their output allocation and shared by their quantized consumers.
     std::unordered_set<const ggml_tensor *> shared_q8_1_inputs;

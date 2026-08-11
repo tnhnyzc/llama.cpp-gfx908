@@ -57,6 +57,92 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     }
 }
 
+// Exact shallow Qwen3.5/3.6 recurrent producer schedule. The existing SSM
+// launch already maps one 128-channel head tile to each block. For the 32 Q/K
+// tiles, retain the materialized f32 SILU result in shared memory and perform
+// the exact downstream L2 reduction before the block retires. The remaining
+// 48 V tiles follow the ordinary SSM path.
+template <size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_l2_f32_gfx908(
+        const float * src0_ptr, const float * src1_ptr, const float * bias_ptr,
+        const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
+        float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2, const int64_t n_t,
+        float * q_l2_dst, float * k_l2_dst, const float eps) {
+    ggml_cuda_pdl_lc();
+    const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    const float * GGML_CUDA_RESTRICT bias = bias_ptr;
+    float       * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    GGML_UNUSED(src0_nb0);
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+
+    const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1);
+    const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
+    float *       y_block = (float *) ((char *) dst + bidx * dst_nb2 + bidy * split_d_inner * dst_nb0);
+    const int stride_x = src0_nb1 / sizeof(float);
+    const int stride_w = src1_nb1 / sizeof(float);
+    const int stride_y = dst_nb1 / sizeof(float);
+
+    float x[d_conv] = { 0.0f };
+    float w[d_conv] = { 0.0f };
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (size_t j = 0; j < d_conv; ++j) {
+        w[j] = w_block[tid * stride_w + j];
+    }
+    float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
+
+    float y = 0.0f;
+    for (int64_t i = 0; i < n_t; ++i) {
+        float sumf = 0.0f;
+
+        if (i == 0) {
+            for (size_t j = 0; j < d_conv; ++j) {
+                x[j] = x_block[tid * stride_x + j];
+            }
+        } else {
+            x[(i - 1) % d_conv] = x_block[tid * stride_x + i + d_conv - 1];
+        }
+
+#pragma unroll
+        for (size_t j = 0; j < d_conv; ++j) {
+            sumf += x[(i + j) % d_conv] * w[j];
+        }
+        sumf += b;
+        y = ggml_cuda_op_silu_single(sumf);
+        y_block[i * stride_y + tid] = y;
+    }
+
+    __shared__ float norm_values[split_d_inner];
+    __shared__ float norm_scale;
+    if (bidy < 32) {
+        // The shared-memory store is also the explicit f32 materialization
+        // boundary required by the existing graph's numerical contract.
+        norm_values[tid] = y;
+        __syncthreads();
+
+        if (tid < WARP_SIZE) {
+            float tmp = 0.0f;
+#pragma unroll
+            for (int col = tid; col < split_d_inner; col += WARP_SIZE) {
+                const float value = norm_values[col];
+                tmp += value * value;
+            }
+            tmp = warp_reduce_sum(tmp);
+            if (tid == 0) {
+                norm_scale = rsqrtf(fmaxf(tmp, eps * eps));
+            }
+        }
+        __syncthreads();
+
+        float * norm_dst = bidy < 16 ? q_l2_dst : k_l2_dst;
+        const int norm_head = bidy < 16 ? bidy : bidy - 16;
+        norm_dst[norm_head * split_d_inner + tid] = norm_scale * norm_values[tid];
+    }
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
 static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                                const float * __restrict__ bias,
@@ -203,4 +289,44 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
+}
+
+void ggml_cuda_op_ssm_conv_l2_fused(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * silu_dst,
+        ggml_tensor * q_l2_dst, ggml_tensor * k_l2_dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && silu_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_l2_dst->type == GGML_TYPE_F32 && k_l2_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[0] == 4 && src0->ne[1] == 10240 && src0->ne[2] == 1);
+    GGML_ASSERT(src1->ne[0] == 4 && src1->ne[1] == 10240);
+    GGML_ASSERT(silu_dst->ne[0] == 10240 && ggml_nelements(silu_dst) == 10240);
+    GGML_ASSERT(q_l2_dst->ne[0] == 128 && q_l2_dst->ne[1] == 16 && ggml_nelements(q_l2_dst) == 2048);
+    GGML_ASSERT(k_l2_dst->ne[0] == 128 && k_l2_dst->ne[1] == 16 && ggml_nelements(k_l2_dst) == 2048);
+    GGML_ASSERT(ggml_is_contiguous(silu_dst));
+    GGML_ASSERT(ggml_is_contiguous(q_l2_dst));
+    GGML_ASSERT(ggml_is_contiguous(k_l2_dst));
+
+    float q_eps;
+    float k_eps;
+    memcpy(&q_eps, q_l2_dst->op_params, sizeof(float));
+    memcpy(&k_eps, k_l2_dst->op_params, sizeof(float));
+    GGML_ASSERT(q_eps == k_eps && q_eps >= 0.0f);
+
+    const dim3 blocks(1, 80, 1);
+    const dim3 threads(128, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(
+        ssm_conv_l2_f32_gfx908<128, 4>, launch_params,
+        (const float *) src0->data,
+        (const float *) src1->data,
+        nullptr,
+        src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1],
+        (float *) silu_dst->data,
+        silu_dst->nb[0], silu_dst->nb[1], silu_dst->nb[2], 1,
+        (float *) q_l2_dst->data,
+        (float *) k_l2_dst->data,
+        q_eps);
 }

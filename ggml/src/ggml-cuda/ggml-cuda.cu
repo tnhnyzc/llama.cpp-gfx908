@@ -4087,6 +4087,66 @@ static int ggml_cuda_shared_norm_q8_eligible(const ggml_cgraph * cgraph, int nod
     return ggml_cuda_shared_norm_q8_consumer_count(cgraph, mul);
 }
 
+static bool ggml_cuda_ssm_l2_island_eligible(
+        const ggml_cgraph * cgraph, int node_idx,
+        ggml_tensor *& silu, ggml_tensor *& q_l2, ggml_tensor *& k_l2) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_HIP_SSM_L2_ISLAND_GFX908");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enabled || ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_CDNA1 ||
+            node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * ssm = cgraph->nodes[node_idx];
+    silu = cgraph->nodes[node_idx + 1];
+    if (ssm->op != GGML_OP_SSM_CONV || silu->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || silu->src[0] != ssm ||
+            ssm->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 ||
+            ssm->src[0] == nullptr || ssm->src[1] == nullptr ||
+            ssm->src[0]->type != GGML_TYPE_F32 || ssm->src[1]->type != GGML_TYPE_F32 ||
+            ssm->src[0]->ne[0] != 4 || ssm->src[0]->ne[1] != 10240 || ssm->src[0]->ne[2] != 1 ||
+            ssm->src[1]->ne[0] != 4 || ssm->src[1]->ne[1] != 10240 ||
+            silu->ne[0] != 10240 || ggml_nelements(silu) != 10240 ||
+            !ggml_is_contiguous(silu) ||
+            !ggml_cuda_can_fuse(cgraph, node_idx,
+                { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        return false;
+    }
+
+    q_l2 = nullptr;
+    k_l2 = nullptr;
+    const int scan_end = std::min(cgraph->n_nodes, node_idx + 10);
+    for (int j = node_idx + 2; j < scan_end; ++j) {
+        ggml_tensor * candidate = cgraph->nodes[j];
+        if (candidate->op != GGML_OP_L2_NORM || candidate->src[0] == nullptr) {
+            continue;
+        }
+        const ggml_tensor * view = candidate->src[0];
+        if (view->op != GGML_OP_VIEW || view->view_src != silu ||
+                view->type != GGML_TYPE_F32 || candidate->type != GGML_TYPE_F32 ||
+                view->ne[0] != 128 || view->ne[1] != 16 || view->ne[2] != 1 || view->ne[3] != 1 ||
+                !ggml_is_contiguous(candidate)) {
+            continue;
+        }
+        if (view->view_offs == 0) {
+            q_l2 = candidate;
+        } else if (view->view_offs == 128 * 16 * sizeof(float)) {
+            k_l2 = candidate;
+        }
+    }
+
+    if (q_l2 == nullptr || k_l2 == nullptr) {
+        return false;
+    }
+    float q_eps;
+    float k_eps;
+    memcpy(&q_eps, q_l2->op_params, sizeof(float));
+    memcpy(&k_eps, k_l2->op_params, sizeof(float));
+    return q_eps == k_eps && q_eps >= 0.0f;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4096,6 +4156,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    ggml_tensor * ssm_silu = nullptr;
+    ggml_tensor * ssm_q_l2 = nullptr;
+    ggml_tensor * ssm_k_l2 = nullptr;
+    if (ggml_cuda_ssm_l2_island_eligible(cgraph, i, ssm_silu, ssm_q_l2, ssm_k_l2)) {
+        ggml_cuda_op_ssm_conv_l2_fused(*cuda_ctx, node, ssm_silu, ssm_q_l2, ssm_k_l2);
+        cuda_ctx->recurrent_ssm_l2_fused_nodes.insert(ssm_q_l2);
+        cuda_ctx->recurrent_ssm_l2_fused_nodes.insert(ssm_k_l2);
+        static uint64_t census_sequence = 0;
+        static const bool census = [] {
+            const char * env = getenv("GGML_HIP_SSM_L2_ISLAND_CENSUS");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (census && census_sequence++ < 256) {
+            std::fprintf(stderr,
+                "SSM_L2_ISLAND_CENSUS\tsequence=%" PRIu64 "\tssm=%s\tq=%s\tk=%s\n",
+                census_sequence, node->name, ssm_q_l2->name, ssm_k_l2->name);
+        }
+        // SILU is adjacent and can be skipped directly. The view nodes are
+        // no-ops; the two non-adjacent L2 nodes are skipped by identity below.
+        return 1;
+    }
 
     // Exact Qwen3.5 recurrent alpha/beta island:
     //   paired MMVF(alpha,beta) -> ADD -> softplus -> MUL
@@ -5040,6 +5122,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->recurrent_ssm_l2_fused_nodes.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5079,6 +5162,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (cuda_ctx->recurrent_ssm_l2_fused_nodes.erase(node) != 0) {
+                    // Its exact output was materialized by the SSM producer island.
                     continue;
                 }
 
