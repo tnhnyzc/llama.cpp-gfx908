@@ -34,10 +34,6 @@ repository live under `archive/`. There are 66 archive refs in total. Benchmark
 results, profiler captures, engineering notes, the custom ROCm tree, and the
 qualified GDN artifacts were not removed.
 
-The old worktrees and their redundant build products were then deleted. This
-reduced `/home/llm/mi100` from about 55 GB to 23 GB and increased free root-disk
-space from about 78 GB to 111 GB.
-
 Useful commands:
 
 ```sh
