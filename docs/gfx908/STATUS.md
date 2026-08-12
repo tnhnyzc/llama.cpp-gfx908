@@ -1,68 +1,63 @@
 # gfx908 production status
 
-This is the concise source of truth for the MI100 fork as frozen on 2026-08-10.
+This is the concise source of truth for the qualified MI100 state on
+2026-08-12.
 
 ## Source and deployment
 
-- Public branches: `gfx908-production` and `upstream` only.
-- Qualified binary source: `bef57196449ac04d8dd61412faabb69a917bb3af`.
-- Dated build:
-  `/home/llm/mi100/llama.cpp-gfx908/build-prod-20260810-bailingmoe3`.
-- Previous build and pre-deployment config remain available for rollback.
-- `llama-swap` MI100-only llama.cpp profiles use the dated build; mixed and
-  vLLM profiles are unchanged.
+- Qualified code head: `711c7bccf5580e2b68a2342e70a73808c4b5534e`.
+- Qualified SSM-to-Q/K L2 commit: `10321d50fd4447b629627cf75b2ccc90d0b7c4b5`.
+- Upstream merged through: `0b1bad14ff204627636aeb1de22ddcd5acb859d4`.
+- Validated build:
+  `/home/llm/bench/build-gfx908-production-ssm-l2-upstream-20260812`.
+- Deployed Qwen3.6-27B IQ4 build:
+  `/home/llm/mi100/llama.cpp-gfx908/build-prod-20260812-ssm-l2-upstream`.
 
-The final build reports llama.cpp `10398 (bef571964)` and passed:
+The validated and deployed `llama-server` and `libggml-hip.so` hashes match.
+The earlier recurrent-epilogue build and pre-deployment configuration remain
+available for rollback. Other serving profiles were not migrated merely to
+standardize paths.
 
-- 1358/1358 selected ROCm RMS_NORM, MUL, and MUL_MAT cases;
-- the architecture registry, including BailingMoE3; and
-- 111 chat-parser tests / 524 assertions with zero failures.
+## Validation
 
-## Qualified shallow-B1 composition
+The build reports llama.cpp `10430 (711c7bccf)` and passed:
 
-The production code contains exactly four newly qualified effects:
+- 1216/1216 selected ROCm backend cases;
+- exactly 48 unique recurrent groups and 192 construction records;
+- deterministic 32-token repeat comparison; and
+- the expected seven graph boundaries for SSM-to-Q/K L2, bitwise against its
+  same-parent control.
 
-1. CDNA1 MMVF 256-thread selection;
-2. recurrent paired-256 MMVF execution for 48 sibling pairs;
-3. a 48-group recurrent norm-scale/q8/paired-MMVF island; and
-4. the disjoint strict direct norm-to-q8 route for 80 producers and 112 MMVQ
-   consumers.
+The current stock performance and fixed-context correctness comparison is in
+[README.md](README.md). The latest isolated feature recovered
+`0.3944 ms/token` over six collector-controlled pairs; its 95% interval was
+`0.2910–0.4978 ms/token`.
 
-Together they measure `41.7817 t/s / 23.933923 ms/token` on the canonical
-Qwen3.6-27B IQ4_NL shallow-B1 workload. The recurrent population takes
-priority over direct q8, preventing overlap or double counting.
+## Active IQ4 production controls
 
-## Runtime controls
+- `GGML_HIP_GDN_CHUNK_GFX908=1`
+- `GGML_HIP_GEMM_AUTOTUNE_GFX908=1`
+- `GGML_HIP_IQ4_NL_FUSED_GFX908=1`
+- `GGML_HIP_DISABLE_GFX908_M2_GATE_FUSION=1`
+- `GGML_HIP_RECURRENT_MMVF_PAIR_GFX908=1`
+- `GGML_HIP_RECURRENT_NORM_SCALE_ISLAND_GFX908=1`
+- `GGML_HIP_RECURRENT_EPILOGUE_ISLAND_GFX908=1`
+- `GGML_HIP_SSM_L2_ISLAND_GFX908=1`
+- `GGML_HIP_SHARED_NORM_Q8_GFX908=1`
 
-- `GGML_HIP_GEMM_AUTOTUNE_GFX908=1` enables exact-shape rocBLAS tuning; use
-  `GGML_HIP_GEMM_AUTOTUNE_CACHE` for the persistent cache.
-- `GGML_HIP_GDN_CHUNK_GFX908=1` enables the qualified chunked recurrent path;
-  `GGML_HIP_GDN_CHUNK_GFX908_DIR` must identify the packaged HSACO directory.
-- `GGML_HIP_Q5_K_MMQ_N3_GFX908=1` enables the retained Q5_K N3 route.
-- `GGML_HIP_RECURRENT_MMVF_PAIR_GFX908=1` selects the 48-pair projection path.
-- `GGML_HIP_RECURRENT_NORM_SCALE_ISLAND_GFX908=1` selects the dependent
-  norm-scale island and requires the recurrent pair route.
-- `GGML_HIP_SHARED_NORM_Q8_GFX908=1` selects the strict disjoint direct-q8 path.
+Each specialized route is guarded by architecture, shape, graph, and fanout
+eligibility. Turning off a control returns to the retained general path; the
+GDN runtime additionally requires its packaged HSACO directory. See
+[BUILD.md](BUILD.md) before enabling these controls for a different model.
 
-The older guarded CDNA1 dequantization, MMVQ, flash-attention, and exact-shape
-prefill controls remain in source. See `--help`, source guards, and
-[BUILD.md](BUILD.md) before enabling a route on a different model or shape.
+## Scope and exclusions
 
-## Serving notes
+The current SSM-to-Q/K L2 route preserves the SSM producer's ownership and
+absorbs exact downstream normalization before its Q/K tiles retire. It does not
+revive the earlier consumer-side Q/K L2-GDN reconstruction experiment, which
+remains excluded.
 
-- Qwen3.6/Qwen3.8 and Gemma 4 MTP profiles explicitly use
-  `--spec-draft-p-min 0.0`; Qwen testing found `0.5` slower despite a higher
-  reported acceptance ratio.
-- Muse retains its separately established DFlash `p_min=0.6` setting.
-- Gemma 4 plus its real MTP model loaded and generated successfully.
-- Ling 3.0 Flash loaded and generated through BailingMoE3. Its single cold,
-  partly host-offloaded observation is not a qualified performance result.
-
-## Explicit exclusions
-
-Production does not include the failed or below-threshold MTP N3 one-wave,
-stripped/one-wave IQ4_NL, mixed f32+q8, generic wave64 packing, Q/K L2-GDN,
-MMVF split-column, recurrent gated-q8, destructive MMVQ, or STREAM-floor
-experiments. Do not infer production support from their archived source.
-
-No further optimization branch is open at this freeze point.
+Other failed or below-threshold experiments are likewise not present in the
+production composition. Historical measurements remain in
+[BENCHMARKS.md](BENCHMARKS.md) and dated checkpoint documents. No experimental
+source branch is open at this checkpoint.

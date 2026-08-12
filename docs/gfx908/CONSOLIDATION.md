@@ -1,7 +1,7 @@
 # gfx908 deployment consolidation
 
 > Historical note: this describes the 2026-08-02 consolidation. It has been
-> superseded operationally by the 2026-08-10 production state in
+> superseded operationally by the current production state in
 > [STATUS.md](STATUS.md), but remains useful provenance.
 
 On 2026-08-02 the MI100 llama.cpp deployment was reduced to one source tree and

@@ -53,5 +53,7 @@ Before changing a serving profile:
 5. smoke the affected real model and speculative route; and
 6. deploy to a new dated directory while retaining the previous build/config.
 
-The current qualified build and exact results are recorded in
-[STATUS.md](STATUS.md) and [QUALIFIED-B1-20260810.md](QUALIFIED-B1-20260810.md).
+The current qualified build and results are recorded in [STATUS.md](STATUS.md)
+and [README.md](README.md). The dated
+[QUALIFIED-B1-20260810.md](QUALIFIED-B1-20260810.md) page remains an earlier
+same-parent checkpoint.

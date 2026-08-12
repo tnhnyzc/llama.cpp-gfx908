@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: >-
+  If the gfx908 optimization work is useful in research or downstream
+  software, please cite this repository.
+title: "llama.cpp-gfx908: AMD Instinct MI100 optimization fork"
+type: software
+authors:
+  - name: "Tunahan (tnhnyzc)"
+repository-code: "https://github.com/tnhnyzc/llama.cpp-gfx908"
+url: "https://github.com/tnhnyzc/llama.cpp-gfx908"
+license: MIT
+version: "2026.08.12"
+date-released: "2026-08-12"
