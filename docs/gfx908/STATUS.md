@@ -28,6 +28,12 @@ The build reports llama.cpp `10430 (711c7bccf)` and passed:
 - the expected seven graph boundaries for SSM-to-Q/K L2, bitwise against its
   same-parent control.
 
+An identical-binary process control accepted the fresh-process benchmark
+fixture. The subsequent fixed 20-pair clean-build comparison measured
+`711c7bccf` minus feature-only `10321d50f` at `-0.0026 ms/token`, with its 95%
+interval `[-0.0605,+0.0552]` entirely inside the predeclared
+`±0.100 ms/token` equivalence margin.
+
 The current stock performance and fixed-context correctness comparison is in
 [README.md](README.md). The latest isolated feature recovered
 `0.3944 ms/token` over six collector-controlled pairs; its 95% interval was

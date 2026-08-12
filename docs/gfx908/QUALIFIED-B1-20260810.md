@@ -3,7 +3,9 @@
 > **Current disposition:** this four-effect state was committed, qualified
 > through upstream merge `e9bc41ced`, and released in the production binary
 > sourced from `bef571964`. The upstream merge was performance-equivalent and
-> does not replace the frozen calibration below.
+> does not replace the frozen calibration below. This is a historical
+> same-parent checkpoint, not the current fork-versus-stock baseline; see
+> [README.md](README.md) for the qualified 2026-08-12 release.
 
 This record freezes the last fully measured state on upstream parent
 `ead92eb55c6b17f45af99fbcf381414e76757f92` before the August 10 upstream

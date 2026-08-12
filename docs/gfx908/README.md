@@ -63,6 +63,11 @@ averaged `43.417 t/s`. The latest same-parent SSM-to-Q/K L2 A/B recovered
 
 ## Correctness result
 
+Within the tested Qwen3.6-27B IQ4_NL and Q6_K production paths, no correctness
+regression was detected. The affected same-parent optimization boundaries remain
+bitwise equal; independent stock and CPU comparisons show only small numerical
+drift between backend/toolchain builds.
+
 Cross-build floating-point output is not expected to be bit-identical, so the
 external check replays the same canonical token context at every step instead
 of allowing an early near-tie to cascade through the rest of a generation. The
@@ -116,6 +121,7 @@ rather than being presented as supported public features.
 - [QUALIFIED-B1-20260810.md](QUALIFIED-B1-20260810.md) — earlier same-parent
   B1 checkpoint
 - [ENGINEERING.md](ENGINEERING.md) — architecture findings and corrections
+- [CONSOLIDATION.md](CONSOLIDATION.md) — dated deployment-consolidation record
 
 The rest of the repository follows upstream llama.cpp. Upstream documentation
 remains authoritative for general use.

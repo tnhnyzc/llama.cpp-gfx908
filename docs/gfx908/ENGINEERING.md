@@ -52,7 +52,11 @@ Prompt processing and token generation required different work:
 These corrections are part of the result, not historical clutter: they explain
 why the current branch contains regression oracles and conservative guards.
 
-## Current bottleneck map
+## Retained architecture findings
+
+The findings below retain their measured parent and workload. They explain the
+current implementation, but their historical timings are not estimates of
+unclaimed headroom in the latest release.
 
 ### Prompt processing
 
@@ -66,8 +70,8 @@ why the current branch contains regression oracles and conservative guards.
 
 ### Decode
 
-- MMVQ is the dominant kernel family and approximately 66-74% of representative
-  token time, depending on model and context.
+- MMVQ was the dominant kernel family in the retained representative profiles,
+  at approximately 66-74% of token time depending on model and context.
 - Q4_K/Q5_K metadata work had a real CDNA1 branch-divergence opportunity and is
   addressed here.
 - Arithmetic deletion probes show that IQ4_NL is not primarily ALU-bound, but
@@ -95,9 +99,9 @@ why the current branch contains regression oracles and conservative guards.
   37.5%; gfx908 shuffle/control cost exceeds any saved replicated requests. A
   CDNA1 two-iteration outer-K-loop unroll is also neutral/slightly negative at
   -0.21% end to end; compiler loop hints do not expose the missing MLP.
-- Roughly 1,780 dispatches per representative token make launch and graph gaps
-  relevant, but removing them is mostly an upstream graph/fusion problem rather
-  than a simple gfx908 kernel switch.
+- Roughly 1,780 dispatches in an earlier representative token made launch and
+  graph gaps relevant, but later exact decomposition showed that much of the
+  non-projection tail is semantic work rather than generic replay overhead.
 - Standalone adjacent Q8_1 activation reuse is measured and parked. Qwen3.6-27B
   Q6_K has 80 reusable sibling quantizations among 337 MMVQ calls per decode
   evaluation (23.74%). A graph-disabled prototype removes exactly those 80
@@ -112,29 +116,28 @@ why the current branch contains regression oracles and conservative guards.
 
 ## Highest-value future work
 
-1. Integrate and rebase the qualified Q6_K zero-point-dot reformulation, then
-   inspect the remaining Q6 ISA for similarly algebraic instruction deletion.
-   Preserve exact local scale ownership; Q8_1's whole-block sum cannot replace
-   the local correction because a Q8 block crosses two Q6 scale groups.
-2. If pursuing a new packed Q6 layout, require it to reduce unpack instructions
-   or improve cross-iteration latency. Transaction-only repacking has at most
-   about 1.4% traffic to recover on the measured fused dispatch. Do not repeat
-   projection splitting, metadata shuffles, or transparent full-stage AGPR/VGPR
-   prefetching; those exact interventions are rejected above.
-3. At long context, prototype a GQA-packed flash-attention vec kernel that
-   shares each KV-head stream across all six Q heads. Do not route to the
-   existing MMA kernel; that intervention regressed approximately 14%.
-4. Rebase the clean stack onto current upstream and re-establish the oracle.
-5. Package the chunked GDN source/assets reproducibly.
-6. Compare CUDA and HIP with the same model, depth, speculation and profiler
-   correction to isolate launch latency and memory-level parallelism.
-7. Do not pursue standalone adjacent activation caching further: its measured
-   whole-kernel ceiling is about 1%. Revisit shared activations only inside a
-   persistent/fused projection design that removes larger launch/gap costs too.
-8. Continue the fused FP16-MFMA path by transplanting the block-owned quant
-   decoder into a selected exact-shape Tensile-class schedule.
-9. Treat Vulkan as a later independent backend port using HIP as the oracle,
-   rather than assuming HIP tuning transfers automatically.
+The Q6_K zero-point reformulation, portable GDN route, same-source CUDA mirror,
+and upstream requalification listed here previously are complete. The current
+order is deliberately narrower:
+
+1. Census unclaimed producer-consumer populations that could absorb exact
+   downstream work before values retire, while preserving graph-visible f32
+   boundaries, fanout semantics, and independently schedulable workgroups.
+   Source work requires a coherent class near `0.5 ms/token` and a first valid
+   mechanism near `0.2 ms/token`.
+2. Revisit projection only with a concrete same-byte execution contract that
+   preserves the successful two-row, K-coalesced ownership and CU exposure.
+   The fitted fixed/instruction differential is calibration evidence, not a
+   directly recoverable budget.
+3. Keep long-context flash-attention work separate from shallow batch-one
+   decode, with its own context-dependent whole-model gate.
+4. Continue dated upstream merges only through the build, correctness, route,
+   process-control, and rollback procedure in [UPSTREAM.md](UPSTREAM.md).
+
+Previously rejected projection splitting, metadata shuffles, full-stage
+prefetch, fixed-block compression, and standalone activation caching should not
+be reopened without a materially different ownership or representation
+contract.
 
 ## Evidence levels
 
